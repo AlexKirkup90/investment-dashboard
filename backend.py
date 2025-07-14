@@ -135,7 +135,8 @@ def run_backtest(start='2013-01-01', end=None, val_start='2016-01-01'):
     df = pd.DataFrame(results).set_index('Date')
     df['Cumulative'] = (1+df['Return']).cumprod()
     return df
-
+# backward-compat alias for Streamlit app
+run_backtest_pipeline = run_backtest
 # ==============================================================================
 # End of V12 - Ultimate Engine
 # ==============================================================================
