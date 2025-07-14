@@ -18,7 +18,13 @@ from dateutil.relativedelta import relativedelta
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score
-from lightgbm import LGBMRegressor
+try:
+    from lightgbm import LGBMRegressor
+    _HAS_LGBM = True
+except ImportError:
+    _HAS_LGBM = False
+    # LightGBM not available, will fallback to GBM only
+
 import pandas_datareader.data as web
 from scipy.optimize import minimize
 import warnings
@@ -69,99 +75,13 @@ def fetch_data(tickers, start, end):
 
 # --- AutoML-lite: Choose best model ---
 def choose_best_model(X, y):
+        # Prepare candidate models
     models = {
-        'GBM': GradientBoostingRegressor(loss='quantile', alpha=0.5, n_estimators=100),
-        'LGBM': LGBMRegressor(n_estimators=100)
+        'GBM': GradientBoostingRegressor(loss='quantile', alpha=0.5, n_estimators=100)
     }
-    tscv = TimeSeriesSplit(n_splits=3)
-    best, best_score = None, np.inf
-    for name, mdl in models.items():
-        scores = -cross_val_score(mdl, X, y, cv=tscv, scoring='neg_mean_absolute_error')
-        if scores.mean() < best_score:
-            best_score, best = scores.mean(), mdl
-    return best
+    if _HAS_LGBM:
+        models['LGBM'] = LGBMRegressor(n_estimators=100)
 
-# --- Feature Engineering ---
-def engineer_features(closes, highs, lows, macro, sector_map, fund_cache):
-    # Monthly aggregates
-    mp = closes.resample('M').last()
-    mh = highs.resample('M').max()
-    ml = lows.resample('M').min()
-    mr = mp.pct_change().dropna()
-    ms = mp['SPY'].pct_change().dropna()
-    # Indicators vectorized
-    ema12 = mp.ewm(span=12, adjust=False).mean()
-    ema26 = mp.ewm(span=26, adjust=False).mean()
-    macd     = ema12 - ema26
-    macd_sig = macd.ewm(span=9, adjust=False).mean()
-    # ADX
-    pdm = mh.diff().clip(lower=0)
-    mdm = -ml.diff().clip(upper=0)
-    tr1 = mh - ml
-    tr2 = (mh - mp.shift(1)).abs()
-    tr3 = (ml - mp.shift(1)).abs()
-    tr = pd.concat([tr1,tr2,tr3], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1/14, adjust=False).mean()
-    plus_di  = 100 * pdm.ewm(alpha=1/14).mean().div(atr)
-    minus_di = 100 * mdm.ewm(alpha=1/14).mean().div(atr)
-    dx = ((plus_di-minus_di).abs().div(plus_di+minus_di+1e-9))*100
-    adx = dx.ewm(alpha=1/14).mean()
-    # Sector momentum
-    t2s = pd.Series(sector_map)
-    sec_ret = mr.groupby(t2s, axis=1).mean()
-    sec_mom1 = sec_ret.rolling(1).mean()
-
-    features = {}
-    for t in [c for c in mp.columns if c not in ['SPY','^VIX']]:
-        df = pd.DataFrame(index=mr.index)
-        ret = mr[t]
-        # Base features
-        df['M1'] = ret.shift(1)
-        df['Vol3'] = ret.rolling(3).std().shift(1)
-        df['Beta'] = ret.rolling(12).cov(ms).shift(1).div(ms.rolling(12).var())
-        df['VIX'] = mp['^VIX'].shift(1)
-        # Tech
-        df['MACD']        = macd[t]
-        df['MACD_Signal'] = macd_sig[t]
-        df['ADX']         = adx[t]
-        # Sector
-        sec = sector_map.get(t)
-        df['SecMom1'] = sec_mom1[sec].shift(1) if sec in sec_mom1 else 0
-        df['SecRel1'] = df['M1'] - df['SecMom1']
-        # Fundamentals
-        f = get_fundamentals(t, fund_cache)
-        df['PE'], df['PB'], df['ROE'] = f['PE'], f['PB'], f['ROE']
-        # Macro
-        if not macro.empty:
-            md = macro[['CPI_YoY','ISM']].resample('M').last().shift(1)
-            df = df.join(md).ffill()
-        # Target
-        df['Target'] = ret.shift(-1)
-        df.dropna(inplace=True)
-        if not df.empty:
-            features[t] = df
-    return features
-
-# --- Portfolio Optimization w/ confidence & turnover ---
-def optimize_weights(exp_ret, hist_ret, prev_w=None, trade_cost=0.0015, sector_map=None):
-    # Confidence weight adjustment
-    unc = exp_ret['P90'] - exp_ret['P10']
-    conf = exp_ret['P50'].div(unc+1e-9)
-    adj = exp_ret['P50'].mul(conf.div(conf.sum()))
-    # Cov
-    cov = hist_ret.cov()*12
-    tickers = exp_ret.index.tolist()
-    # Constraints
-    def neg_sharpe(w):
-        p_ret = w.dot(adj)*12
-        p_vol = np.sqrt(w.dot(cov).dot(w))
-        return -p_ret/(p_vol+1e-9)
-    cons=[{'type':'eq','fun':lambda w: w.sum()-1}]
-    # Sector cap
-    if sector_map:
-        sector_index = {s:[i for i,t in enumerate(tickers) if sector_map[t]==s] for s in set(sector_map.values())}
-        for inds in sector_index.values():
-            cons.append({'type':'ineq','fun':lambda w,inds=inds:0.30-w[inds].sum()})
     bnds = [(0,0.25)]*len(tickers)
     init = np.ones(len(tickers))/len(tickers)
     res = minimize(neg_sharpe, init, method='SLSQP',bounds=bnds,constraints=cons)
