@@ -1,0 +1,10 @@
+pandas
+numpy
+yfinance
+requests
+joblib
+scikit-learn
+xgboost
+pandas-datareader
+scipy
+streamlit
