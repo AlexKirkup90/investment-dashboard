@@ -1,8 +1,9 @@
 # ==============================================================================
-# V7 - BACKEND ENGINE WITH SECTOR MOMENTUM
+# V8 - FINAL INTEGRATED ENGINE (BACKEND)
 # ==============================================================================
-# This version enhances the feature engineering process by adding sector-level
-# momentum features to better contextualize individual stock performance.
+# This is the definitive backend. It combines the Walk-Forward Validation
+# engine, the Portfolio Optimizer, and the enhanced Sector Momentum features
+# into a single, robust script.
 # ==============================================================================
 
 import pandas as pd
@@ -13,9 +14,11 @@ import joblib
 import os
 import json
 from datetime import datetime
+from dateutil.relativedelta import relativedelta
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import GradientBoostingRegressor
 import pandas_datareader.data as web
+from scipy.optimize import minimize
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -37,11 +40,11 @@ def save_fundamentals_cache(cache):
     with open(FUNDAMENTALS_CACHE_FILE, 'w') as f:
         json.dump(cache, f, indent=4)
 
-def get_fundamentals(ticker, cache, st_status):
-    """Fetches fundamentals with progress updates for Streamlit."""
+def get_fundamentals(ticker, cache, st_status=None):
+    """Fetches fundamentals with optional progress updates for Streamlit."""
     if ticker in cache: return cache[ticker]
     try:
-        st_status.text(f"Fetching fundamentals for {ticker}...")
+        if st_status: st_status.text(f"Fetching fundamentals for {ticker}...")
         info = yf.Ticker(ticker).info
         fundamentals = {'PE': info.get('trailingPE'), 'PB': info.get('priceToBook'), 'ROE': info.get('returnOnEquity')}
         cache[ticker] = fundamentals
@@ -52,8 +55,8 @@ def get_fundamentals(ticker, cache, st_status):
 
 # --- Data Fetching ---
 @memory.cache
-def fetch_sp500_constituents(st_status):
-    st_status.text("Fetching S&P 500 constituents...")
+def fetch_sp500_constituents(st_status=None):
+    if st_status: st_status.text("Fetching S&P 500 constituents...")
     url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
     df_sp500 = pd.read_html(requests.get(url).text)[0]
     tickers = [t.replace('.', '-') for t in df_sp500['Symbol'].tolist()]
@@ -61,124 +64,112 @@ def fetch_sp500_constituents(st_status):
     return tickers, sector_map
 
 @memory.cache
-def fetch_market_data(tickers, start, end, st_status):
-    st_status.text("Downloading market data...")
+def fetch_market_data(tickers, start, end, st_status=None):
+    if st_status: st_status.text("Downloading market data...")
     all_tickers = tickers + ['SPY', '^VIX']
     prices = yf.download(all_tickers, start=start, end=end, auto_adjust=True, timeout=30)['Close']
-    yc_slope = (web.DataReader('DGS10', 'fred', start, end)['DGS10'] - 
-                web.DataReader('DGS2', 'fred', start, end)['DGS2']).dropna()
-    return prices, yc_slope
+    return prices
 
 # --- Feature Engineering ---
-def engineer_features(prices, yc_slope, sector_map, fundamentals_cache, st_status):
-    """
-    Engineers features for all historical data, now including sector momentum.
-    """
-    st_status.text("Engineering features for all tickers...")
+def engineer_features(prices, sector_map, fundamentals_cache, st_status=None):
+    """Engineers features for all historical data, including sector momentum."""
+    if st_status: st_status.text("Engineering features...")
     monthly_prices = prices.resample('M').last()
     monthly_returns = monthly_prices.pct_change()
     monthly_spy_returns = monthly_prices['SPY'].pct_change()
 
-    # --- NEW: Calculate Sector Momentum ---
-    st_status.text("Calculating sector momentum...")
-    # Create a DataFrame mapping tickers to sectors
+    if st_status: st_status.text("Calculating sector momentum...")
     ticker_to_sector = pd.Series(sector_map)
-    # Group returns by sector and calculate the mean return for each sector each month
     sector_monthly_returns = monthly_returns.groupby(ticker_to_sector, axis=1).mean()
-    # Calculate 1-month and 3-month rolling momentum for each sector
     sector_mom_1m = sector_monthly_returns.rolling(1).mean()
     sector_mom_3m = sector_monthly_returns.rolling(3).mean()
-    # --- END NEW ---
     
     features_dict = {}
     tickers = [t for t in prices.columns if t not in ['SPY', '^VIX']]
     
     for i, ticker in enumerate(tickers):
-        st_status.text(f"Engineering features for {ticker} ({i+1}/{len(tickers)})...")
+        if st_status: st_status.text(f"Engineering features for {ticker} ({i+1}/{len(tickers)})...")
         try:
-            ret, prc = monthly_returns[ticker], monthly_prices[ticker]
+            ret = monthly_returns[ticker]
             df = pd.DataFrame(index=monthly_returns.index)
-            
-            # --- Standard Features ---
             df['M1'] = ret.shift(1)
             df['M3'] = ret.rolling(3).mean().shift(1)
             df['M12'] = ret.rolling(12).mean().shift(1)
             df['Vol3'] = ret.rolling(3).std().shift(1)
             df['Beta'] = ret.rolling(12).cov(monthly_spy_returns).shift(1) / monthly_spy_returns.rolling(12).var().shift(1)
             df['VIX'] = monthly_prices['^VIX'].shift(1)
-            df['YC_slope'] = yc_slope.resample('M').last().shift(1)
             
-            # --- NEW: Add Sector Momentum Features ---
             ticker_sector = sector_map.get(ticker)
             if ticker_sector in sector_mom_1m.columns:
                 df['SectorMom_1M'] = sector_mom_1m[ticker_sector].shift(1)
                 df['SectorMom_3M'] = sector_mom_3m[ticker_sector].shift(1)
-                # Feature: Stock's momentum relative to its sector
                 df['SectorRel_1M'] = df['M1'] - df['SectorMom_1M']
             else:
-                # If sector data isn't available, fill with 0
-                df['SectorMom_1M'] = 0
-                df['SectorMom_3M'] = 0
-                df['SectorRel_1M'] = 0
-            # --- END NEW ---
+                df['SectorMom_1M'], df['SectorMom_3M'], df['SectorRel_1M'] = 0, 0, 0
 
             fundamentals = get_fundamentals(ticker, fundamentals_cache, st_status)
             df['PE'], df['PB'], df['ROE'] = fundamentals['PE'], fundamentals['PB'], fundamentals['ROE']
             
             df['Target'] = ret.shift(-1)
             df.dropna(inplace=True)
-            if not df.empty:
-                features_dict[ticker] = df
-        except Exception:
-            continue
+            if not df.empty: features_dict[ticker] = df
+        except Exception: continue
             
     return features_dict
 
-# --- Live Prediction Model ---
-def generate_live_predictions(features_dict, st_status):
-    """Trains one final model on all data and predicts for the next month."""
-    st_status.text("Training final models...")
-    
-    X_train_list, y_train_list = [], []
-    X_pred_list, pred_tickers = [], []
+# --- Portfolio Optimization ---
+def optimize_portfolio_weights(expected_returns, historical_returns):
+    """Calculates optimal portfolio weights to maximize the Sharpe Ratio."""
+    num_assets, cov_matrix = len(expected_returns), historical_returns.cov() * 12
+    def neg_sharpe(weights):
+        p_return = np.sum(expected_returns * weights) * 12
+        p_vol = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
+        return -p_return / (p_vol + 1e-9)
+    constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
+    bounds = tuple((0, 0.25) for _ in range(num_assets))
+    result = minimize(neg_sharpe, [1./num_assets]*num_assets, method='SLSQP', bounds=bounds, constraints=constraints)
+    return pd.Series(result.x, index=expected_returns.index)
 
-    for ticker, df in features_dict.items():
-        X_train_list.append(df.drop(columns='Target').values)
-        y_train_list.append(df['Target'].values)
-        X_pred_list.append(df.drop(columns='Target').iloc[-1].values)
-        pred_tickers.append(ticker)
-    
-    if not X_train_list or not X_pred_list:
-        return pd.DataFrame()
-
-    X_train, y_train = np.vstack(X_train_list), np.hstack(y_train_list)
-    X_pred = np.vstack(X_pred_list)
-
-    scaler = StandardScaler().fit(X_train)
-    X_train_s, X_pred_s = scaler.transform(X_train), scaler.transform(X_pred)
-
-    st_status.text("Generating quantile predictions...")
-    p50 = GradientBoostingRegressor(loss='quantile', alpha=0.5, n_estimators=100).fit(X_train_s, y_train).predict(X_pred_s)
-    
-    predictions_df = pd.DataFrame({
-        'Ticker': pred_tickers,
-        'Predicted_Return_P50': p50,
-    }).sort_values('Predicted_Return_P50', ascending=False).reset_index(drop=True)
-    
-    return predictions_df
+# --- Walk-Forward Validation ---
+def run_walk_forward_validation(features_dict, validation_start_date, st_status=None):
+    """Runs the main walk-forward validation loop."""
+    all_results = []
+    prediction_dates = pd.to_datetime(sorted([d for d in list(features_dict.values())[0].index if d >= validation_start_date]))
+    for i, prediction_date in enumerate(prediction_dates):
+        if st_status: st_status.text(f"Running backtest for {prediction_date.strftime('%Y-%m')} ({i+1}/{len(prediction_dates)})...")
+        train_end_date = prediction_date - relativedelta(months=1)
+        X_train, y_train, X_test, tickers, actuals = [], [], [], [], []
+        for ticker, df in features_dict.items():
+            train_df = df[df.index <= train_end_date]
+            if len(train_df) >= 24:
+                X_train.append(train_df.drop(columns='Target').values)
+                y_train.append(train_df['Target'].values)
+            if prediction_date in df.index:
+                test_row = df.loc[prediction_date]
+                X_test.append(test_row.drop('Target').values)
+                actuals.append(test_row['Target'])
+                tickers.append(ticker)
+        if not X_test or not X_train: continue
+        X_train, y_train, X_test = np.vstack(X_train), np.hstack(y_train), np.vstack(X_test)
+        scaler = StandardScaler().fit(X_train)
+        p50 = GradientBoostingRegressor(loss='quantile', alpha=0.5, n_estimators=100).fit(scaler.transform(X_train), y_train).predict(scaler.transform(X_test))
+        month_results = pd.DataFrame({'PredictionDate': prediction_date, 'Ticker': tickers, 'P50': p50, 'ActualReturn': actuals})
+        all_results.append(month_results)
+    return pd.concat(all_results, ignore_index=True)
 
 # --- Main Orchestration Function ---
-def run_prediction_pipeline(st_status):
-    """The main function called by the Streamlit app to run the pipeline."""
+def run_backtest_pipeline(st_status):
+    """The main function called by the Streamlit app to run the full backtest."""
     START_DATE, END_DATE = '2013-01-01', datetime.today().strftime('%Y-%m-%d')
+    VALIDATION_START_DATE = pd.to_datetime('2016-01-01')
     
     tickers, sector_map = fetch_sp500_constituents(st_status)
-    prices, yc_slope = fetch_market_data(tickers, START_DATE, END_DATE, st_status)
+    prices = fetch_market_data(tickers, START_DATE, END_DATE, st_status)
     fundamentals_cache = load_fundamentals_cache()
     
-    features = engineer_features(prices, yc_slope, sector_map, fundamentals_cache, st_status)
+    features = engineer_features(prices, sector_map, fundamentals_cache, st_status)
     save_fundamentals_cache(fundamentals_cache)
     
-    predictions = generate_live_predictions(features, st_status)
+    validation_results = run_walk_forward_validation(features, VALIDATION_START_DATE, st_status)
     
-    return predictions
+    return validation_results, prices
