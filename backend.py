@@ -1,8 +1,8 @@
 # ==============================================================================
-# backend.py — V12 “Ultimate Engine” Complete Backend
+# backend.py — V12.1 “Ultimate Engine” w/o pandas_datareader
 # ==============================================================================
-# Single-pass OHLCV, vectorized MACD/ADX, AutoML-lite, confidence-weighted & turnover-aware
-# optimizer with sector caps, regime features, and backwards-compatible alias.
+# Drops pandas_datareader import; FRED macro fetch wrapped in try/except.
+# All other logic (OHLCV, MACD/ADX, AutoML-lite, optimizer, backtest) remains.
 # ==============================================================================
 
 import pandas as pd
@@ -17,13 +17,20 @@ from dateutil.relativedelta import relativedelta
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score
+
 # LightGBM fallback
 try:
     from lightgbm import LGBMRegressor
     _HAS_LGBM = True
 except ImportError:
     _HAS_LGBM = False
-import pandas_datareader.data as web
+
+# Attempt to import pandas_datareader; if unavailable, set web=None
+try:
+    import pandas_datareader.data as web
+except ImportError:
+    web = None
+
 from scipy.optimize import minimize
 import warnings
 
@@ -86,14 +93,20 @@ def fetch_sp500_constituents():
 @memory.cache
 def fetch_data(tickers, start, end):
     all_t = tickers + ['SPY', '^VIX']
-    raw = yf.download(all_t, start=start, end=end, auto_adjust=True, timeout=30, group_by='ticker')
+    raw = yf.download(all_t, start=start, end=end, auto_adjust=True,
+                      timeout=30, group_by='ticker')
     closes = raw.xs('Close', axis=1, level=1)
     highs  = raw.xs('High',   axis=1, level=1)
     lows   = raw.xs('Low',    axis=1, level=1)
-    try:
-        macro = web.DataReader(['CPIAUCSL','ISM'], 'fred', start, end)
-        macro['CPI_YoY'] = macro['CPIAUCSL'].pct_change(12)*100
-    except:
+
+    # Macro: only if web is available
+    if web:
+        try:
+            macro = web.DataReader(['CPIAUCSL','ISM'], 'fred', start, end)
+            macro['CPI_YoY'] = macro['CPIAUCSL'].pct_change(12)*100
+        except Exception:
+            macro = pd.DataFrame()
+    else:
         macro = pd.DataFrame()
     return closes, highs, lows, macro
 
@@ -119,9 +132,9 @@ def engineer_features(closes, highs, lows, macro, sector_map, fund_cache):
     tr3 = (ml - mp.shift(1)).abs()
     tr = pd.concat([tr1,tr2,tr3], axis=1).max(axis=1)
     atr = tr.ewm(alpha=1/14, adjust=False).mean()
-    plus_di  = 100 * pdm.ewm(alpha=1/14).mean().div(atr)
-    minus_di = 100 * mdm.ewm(alpha=1/14).mean().div(atr)
-    dx = ((plus_di-minus_di).abs().div(plus_di+minus_di+1e-9))*100
+    plus_di  = 100 * pdm.ewm(alpha=1/14).mean() / atr
+    minus_di = 100 * mdm.ewm(alpha=1/14).mean() / atr
+    dx = ((plus_di - minus_di).abs() / (plus_di + minus_di + 1e-9)) * 100
     adx = dx.ewm(alpha=1/14).mean()
 
     # Sector momentum
@@ -137,7 +150,7 @@ def engineer_features(closes, highs, lows, macro, sector_map, fund_cache):
         # Base
         df['M1']   = ret.shift(1)
         df['Vol3'] = ret.rolling(3).std().shift(1)
-        df['Beta'] = ret.rolling(12).cov(ms).shift(1).div(ms.rolling(12).var())
+        df['Beta'] = ret.rolling(12).cov(ms).shift(1) / ms.rolling(12).var()
         df['VIX']  = mp['^VIX'].shift(1)
 
         # Tech
@@ -146,8 +159,8 @@ def engineer_features(closes, highs, lows, macro, sector_map, fund_cache):
         df['ADX']         = adx[t]
 
         # Sector
-        sec = sector_map.get(t)
-        df['SecMom1'] = sec_mom1[sec].shift(1) if sec in sec_mom1 else 0
+        sec_val = sector_map.get(t)
+        df['SecMom1'] = sec_mom1[sec_val].shift(1) if sec_val in sec_mom1 else 0
         df['SecRel1'] = df['M1'] - df['SecMom1']
 
         # Fundamentals
@@ -164,30 +177,31 @@ def engineer_features(closes, highs, lows, macro, sector_map, fund_cache):
         # Target
         df['Target'] = ret.shift(-1)
         df.dropna(inplace=True)
+
         if not df.empty:
             features[t] = df
 
     return features
 
-# --- Optimizer with Confidence & Turnover & Sector Caps ---
+# --- Optimizer with Confidence, Turnover & Sector Caps ---
 def optimize_weights(exp_df, hist_ret, prev_w=None, trade_cost=0.0015, sector_map=None):
     tickers = exp_df.index.tolist()
     p50 = exp_df['P50']
-    # confidence
-    unc  = exp_df['P90'] - exp_df['P10']
-    conf = p50.div(unc+1e-9)
-    adj  = p50.mul(conf.div(conf.sum()))
 
-    cov = hist_ret.cov()*12
+    # confidence‐weighted expected return
+    unc  = exp_df['P90'] - exp_df['P10']
+    conf = p50 / (unc + 1e-9)
+    adj  = p50 * (conf / conf.sum())
+
+    cov = hist_ret.cov() * 12
 
     def neg_sharpe(w):
-        ret = w.dot(adj)*12
+        ret = w.dot(adj) * 12
         vol = np.sqrt(w.dot(cov).dot(w))
-        return -ret/(vol+1e-9)
+        return -ret / (vol + 1e-9)
 
-    cons = [{'type':'eq','fun':lambda w: w.sum()-1}]
+    cons = [{'type':'eq','fun':lambda w: w.sum() - 1}]
     if sector_map:
-        # sector indices
         sectors = {}
         for i,t in enumerate(tickers):
             s = sector_map.get(t)
@@ -195,19 +209,20 @@ def optimize_weights(exp_df, hist_ret, prev_w=None, trade_cost=0.0015, sector_ma
         for inds in sectors.values():
             cons.append({'type':'ineq','fun':lambda w,inds=inds: 0.30 - w[inds].sum()})
 
-    bnds = [(0,0.25)]*len(tickers)
-    init = np.ones(len(tickers))/len(tickers)
-    res = minimize(neg_sharpe, init, method='SLSQP', bounds=bnds, constraints=cons)
-    w   = pd.Series(res.x, index=tickers)
+    bnds = [(0,0.25)] * len(tickers)
+    init = np.ones(len(tickers)) / len(tickers)
+    res  = minimize(neg_sharpe, init, method='SLSQP',
+                    bounds=bnds, constraints=cons)
+    w    = pd.Series(res.x, index=tickers)
 
     # turnover cost
     if prev_w is not None and not prev_w.empty:
         tr   = np.abs(w - prev_w).sum()
-        w   *= (1 - tr*trade_cost)
+        w   *= (1 - tr * trade_cost)
 
     return w
 
-# --- Walk-Forward Backtester ---
+# --- Walk‐Forward Backtest ---
 def run_backtest(start='2013-01-01', end=None, val_start='2016-01-01'):
     if end is None:
         end = datetime.today().strftime('%Y-%m-%d')
@@ -234,6 +249,7 @@ def run_backtest(start='2013-01-01', end=None, val_start='2016-01-01'):
                 test_x.append(row.drop('Target').values)
                 actuals.append(row['Target'])
                 ts.append(t)
+
         if not test_x:
             continue
 
@@ -244,25 +260,26 @@ def run_backtest(start='2013-01-01', end=None, val_start='2016-01-01'):
         scaler = StandardScaler().fit(Xtr)
         P50    = mdl.fit(scaler.transform(Xtr), Ytr).predict(scaler.transform(Xte))
 
-        dfm = pd.DataFrame({'Ticker':ts, 'P50':P50, 'Actual':actuals}).set_index('Ticker')
-        # P10/P90 from quantile GBM for bounds
-        gb   = GradientBoostingRegressor(loss='quantile', alpha=0.1, n_estimators=100, random_state=42)
-        p10  = gb.fit(scaler.transform(Xtr), Ytr).predict(scaler.transform(Xte))
-        p90  = GradientBoostingRegressor(loss='quantile', alpha=0.9, n_estimators=100, random_state=42)\
-                  .fit(scaler.transform(Xtr), Ytr).predict(scaler.transform(Xte))
-        dfm['P10'], dfm['P90'] = p10, p90
+        # Estimate P10/P90 via quantile GBMs
+        gb10 = GradientBoostingRegressor(loss='quantile', alpha=0.1, n_estimators=100, random_state=42)
+        gb90 = GradientBoostingRegressor(loss='quantile', alpha=0.9, n_estimators=100, random_state=42)
+        P10   = gb10.fit(scaler.transform(Xtr), Ytr).predict(scaler.transform(Xte))
+        P90   = gb90.fit(scaler.transform(Xtr), Ytr).predict(scaler.transform(Xte))
 
-        # optimize
+        dfm = pd.DataFrame({
+            'Ticker': ts, 'P10': P10, 'P50': P50, 'P90': P90, 'Actual': actuals
+        }).set_index('Ticker')
+
         hist = closes.resample('M').last().pct_change().loc[:dt].tail(12)[ts]
         w    = optimize_weights(dfm, hist, prev_w, sector_map=sector_map)
         prev_w = w
 
         ret = w.dot(dfm['Actual'])
-        results.append({'Date':dt, 'Return':ret, 'Sharpe':None, 'Weights':w})
+        results.append({'Date': dt, 'Return': ret, 'Weights': w})
 
     out = pd.DataFrame(results).set_index('Date')
     out['Cumulative'] = (1 + out['Return']).cumprod()
     return out
 
-# alias for backwards compatibility
+# backwards‐compatible alias
 run_backtest_pipeline = run_backtest
