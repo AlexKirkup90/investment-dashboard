@@ -1,11 +1,8 @@
 # ==============================================================================
-# V6 - BACKEND ENGINE
+# V7 - BACKEND ENGINE WITH SECTOR MOMENTUM
 # ==============================================================================
-# This file contains all the data processing, feature engineering, and modeling
-# logic. The Streamlit app will call the functions in this file to get live
-# predictions.
-# VERSION 6.1: Fixed __getstate__() error by separating st.status updates
-# from @memory.cache decorated functions.
+# This version enhances the feature engineering process by adding sector-level
+# momentum features to better contextualize individual stock performance.
 # ==============================================================================
 
 import pandas as pd
@@ -44,7 +41,6 @@ def get_fundamentals(ticker, cache, st_status):
     """Fetches fundamentals with progress updates for Streamlit."""
     if ticker in cache: return cache[ticker]
     try:
-        # This function is NOT cached by joblib, so it's safe to pass st_status
         st_status.text(f"Fetching fundamentals for {ticker}...")
         info = yf.Ticker(ticker).info
         fundamentals = {'PE': info.get('trailingPE'), 'PB': info.get('priceToBook'), 'ROE': info.get('returnOnEquity')}
@@ -56,16 +52,17 @@ def get_fundamentals(ticker, cache, st_status):
 
 # --- Data Fetching ---
 @memory.cache
-def fetch_sp500_constituents():
-    # This function IS cached, so we DO NOT pass the st_status object here.
+def fetch_sp500_constituents(st_status):
+    st_status.text("Fetching S&P 500 constituents...")
     url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
     df_sp500 = pd.read_html(requests.get(url).text)[0]
     tickers = [t.replace('.', '-') for t in df_sp500['Symbol'].tolist()]
-    return tickers
+    sector_map = dict(zip(tickers, df_sp500['GICS Sector']))
+    return tickers, sector_map
 
 @memory.cache
-def fetch_market_data(tickers, start, end):
-    # This function IS cached, so we DO NOT pass the st_status object here.
+def fetch_market_data(tickers, start, end, st_status):
+    st_status.text("Downloading market data...")
     all_tickers = tickers + ['SPY', '^VIX']
     prices = yf.download(all_tickers, start=start, end=end, auto_adjust=True, timeout=30)['Close']
     yc_slope = (web.DataReader('DGS10', 'fred', start, end)['DGS10'] - 
@@ -73,12 +70,25 @@ def fetch_market_data(tickers, start, end):
     return prices, yc_slope
 
 # --- Feature Engineering ---
-def engineer_features(prices, yc_slope, fundamentals_cache, st_status):
-    """Engineers features for all historical data for model training."""
+def engineer_features(prices, yc_slope, sector_map, fundamentals_cache, st_status):
+    """
+    Engineers features for all historical data, now including sector momentum.
+    """
     st_status.text("Engineering features for all tickers...")
     monthly_prices = prices.resample('M').last()
     monthly_returns = monthly_prices.pct_change()
     monthly_spy_returns = monthly_prices['SPY'].pct_change()
+
+    # --- NEW: Calculate Sector Momentum ---
+    st_status.text("Calculating sector momentum...")
+    # Create a DataFrame mapping tickers to sectors
+    ticker_to_sector = pd.Series(sector_map)
+    # Group returns by sector and calculate the mean return for each sector each month
+    sector_monthly_returns = monthly_returns.groupby(ticker_to_sector, axis=1).mean()
+    # Calculate 1-month and 3-month rolling momentum for each sector
+    sector_mom_1m = sector_monthly_returns.rolling(1).mean()
+    sector_mom_3m = sector_monthly_returns.rolling(3).mean()
+    # --- END NEW ---
     
     features_dict = {}
     tickers = [t for t in prices.columns if t not in ['SPY', '^VIX']]
@@ -88,6 +98,8 @@ def engineer_features(prices, yc_slope, fundamentals_cache, st_status):
         try:
             ret, prc = monthly_returns[ticker], monthly_prices[ticker]
             df = pd.DataFrame(index=monthly_returns.index)
+            
+            # --- Standard Features ---
             df['M1'] = ret.shift(1)
             df['M3'] = ret.rolling(3).mean().shift(1)
             df['M12'] = ret.rolling(12).mean().shift(1)
@@ -96,6 +108,20 @@ def engineer_features(prices, yc_slope, fundamentals_cache, st_status):
             df['VIX'] = monthly_prices['^VIX'].shift(1)
             df['YC_slope'] = yc_slope.resample('M').last().shift(1)
             
+            # --- NEW: Add Sector Momentum Features ---
+            ticker_sector = sector_map.get(ticker)
+            if ticker_sector in sector_mom_1m.columns:
+                df['SectorMom_1M'] = sector_mom_1m[ticker_sector].shift(1)
+                df['SectorMom_3M'] = sector_mom_3m[ticker_sector].shift(1)
+                # Feature: Stock's momentum relative to its sector
+                df['SectorRel_1M'] = df['M1'] - df['SectorMom_1M']
+            else:
+                # If sector data isn't available, fill with 0
+                df['SectorMom_1M'] = 0
+                df['SectorMom_3M'] = 0
+                df['SectorRel_1M'] = 0
+            # --- END NEW ---
+
             fundamentals = get_fundamentals(ticker, fundamentals_cache, st_status)
             df['PE'], df['PB'], df['ROE'] = fundamentals['PE'], fundamentals['PB'], fundamentals['ROE']
             
@@ -146,19 +172,13 @@ def run_prediction_pipeline(st_status):
     """The main function called by the Streamlit app to run the pipeline."""
     START_DATE, END_DATE = '2013-01-01', datetime.today().strftime('%Y-%m-%d')
     
-    # Update status outside of the cached functions
-    st_status.text("Fetching S&P 500 constituents...")
-    tickers = fetch_sp500_constituents()
-    
-    st_status.text("Downloading market data...")
-    prices, yc_slope = fetch_market_data(tickers, START_DATE, END_DATE)
-    
+    tickers, sector_map = fetch_sp500_constituents(st_status)
+    prices, yc_slope = fetch_market_data(tickers, START_DATE, END_DATE, st_status)
     fundamentals_cache = load_fundamentals_cache()
     
-    features = engineer_features(prices, yc_slope, fundamentals_cache, st_status)
+    features = engineer_features(prices, yc_slope, sector_map, fundamentals_cache, st_status)
     save_fundamentals_cache(fundamentals_cache)
     
     predictions = generate_live_predictions(features, st_status)
     
     return predictions
-
