@@ -9,3 +9,4 @@ pandas-datareader
 scipy
 streamlit
 setuptools
+matplotlib
