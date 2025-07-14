@@ -96,8 +96,8 @@ def choose_best_model(X, y):
 # --- Walk-Forward Validation ---
 def run_backtest(start='2013-01-01', end=None, val_start='2016-01-01'):
     if end is None: end = datetime.today().strftime('%Y-%m-%d')
-    tickers, sector_map = fetch_data.cache.fetch_sp500_constituents()
-    closes, highs, lows, macro = fetch_data.cache.fetch_market_data(tickers, start, end)
+    tickers, sector_map = fetch_sp500_constituents()
+    closes, highs, lows, macro = fetch_data(tickers, start, end)
     fcache = load_fundamentals_cache()
     feats = engineer_features(closes, highs, lows, macro, sector_map, fcache)
     save_fundamentals_cache(fcache)
@@ -135,8 +135,7 @@ def run_backtest(start='2013-01-01', end=None, val_start='2016-01-01'):
     df = pd.DataFrame(results).set_index('Date')
     df['Cumulative'] = (1+df['Return']).cumprod()
     return df
-# backward-compat alias for Streamlit app
-run_backtest_pipeline = run_backtest
+
 # ==============================================================================
 # End of V12 - Ultimate Engine
 # ==============================================================================
