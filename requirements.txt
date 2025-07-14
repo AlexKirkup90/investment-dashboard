@@ -10,3 +10,5 @@ scipy
 streamlit
 setuptools
 matplotlib
+python-dateutil
+lightgbm>=3.3.2
