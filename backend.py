@@ -3,6 +3,8 @@
 # ==============================================================================
 # This version enhances the feature set with key macro-economic indicators
 # (CPI for inflation, PMI for economic health) to make the model regime-aware.
+# VERSION 10.1: Fixed "cannot pickle 'module' object" error by separating
+# st.status updates from cached functions.
 # ==============================================================================
 
 import pandas as pd
@@ -53,8 +55,8 @@ def get_fundamentals(ticker, cache, st_status=None):
 
 # --- Data Fetching ---
 @memory.cache
-def fetch_sp500_constituents(st_status=None):
-    if st_status: st_status.text("Fetching S&P 500 constituents...")
+def fetch_sp500_constituents():
+    # This function IS cached, so we DO NOT pass the st_status object here.
     url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
     df_sp500 = pd.read_html(requests.get(url).text)[0]
     tickers = [t.replace('.', '-') for t in df_sp500['Symbol'].tolist()]
@@ -62,14 +64,12 @@ def fetch_sp500_constituents(st_status=None):
     return tickers, sector_map
 
 @memory.cache
-def fetch_market_data(tickers, start, end, st_status=None):
-    if st_status: st_status.text("Downloading market and macro data...")
+def fetch_market_data(tickers, start, end):
+    # This function IS cached, so we DO NOT pass the st_status object here.
     all_tickers = tickers + ['SPY', '^VIX']
     prices = yf.download(all_tickers, start=start, end=end, auto_adjust=True, timeout=30)['Close']
     
-    # --- NEW: Fetch Macro Data ---
     macro_data = web.DataReader(['CPIAUCSL', 'ISM'], 'fred', start, end)
-    # CPI is monthly, so we calculate Year-over-Year change
     macro_data['CPI_YoY'] = macro_data['CPIAUCSL'].pct_change(12) * 100
     
     return prices, macro_data
@@ -113,10 +113,8 @@ def engineer_features(prices, macro_data, sector_map, fundamentals_cache, st_sta
             fundamentals = get_fundamentals(ticker, fundamentals_cache, st_status)
             df['PE'], df['PB'], df['ROE'] = fundamentals['PE'], fundamentals['PB'], fundamentals['ROE']
             
-            # --- NEW: Add Macro Features ---
-            # Align macro data with our monthly feature dataframe
             df = df.join(macro_data[['CPI_YoY', 'ISM']].resample('M').last().shift(1))
-            df.fillna(method='ffill', inplace=True) # Forward-fill to handle non-trading days
+            df.fillna(method='ffill', inplace=True)
 
             df['Target'] = ret.shift(-1)
             df.dropna(inplace=True)
@@ -167,21 +165,34 @@ def run_walk_forward_validation(features_dict, validation_start_date, st_status=
 def run_backtest_pipeline(st_status):
     START_DATE, END_DATE = '2013-01-01', datetime.today().strftime('%Y-%m-%d')
     VALIDATION_START_DATE = pd.to_datetime('2016-01-01')
-    tickers, sector_map = fetch_sp500_constituents(st_status)
-    prices, macro_data = fetch_market_data(tickers, START_DATE, END_DATE, st_status)
+    
+    # Call cached functions without the status object
+    if st_status: st_status.text("Fetching S&P 500 constituents...")
+    tickers, sector_map = fetch_sp500_constituents()
+    
+    if st_status: st_status.text("Downloading market and macro data...")
+    prices, macro_data = fetch_market_data(tickers, START_DATE, END_DATE)
+    
     fundamentals_cache = load_fundamentals_cache()
     features = engineer_features(prices, macro_data, sector_map, fundamentals_cache, st_status)
     save_fundamentals_cache(fundamentals_cache)
+    
     validation_results = run_walk_forward_validation(features, VALIDATION_START_DATE, st_status)
     return validation_results, prices
 
 def run_live_prediction_pipeline(st_status):
     START_DATE, END_DATE = '2013-01-01', datetime.today().strftime('%Y-%m-%d')
-    tickers, sector_map = fetch_sp500_constituents(st_status)
-    prices, macro_data = fetch_market_data(tickers, START_DATE, END_DATE, st_status)
+
+    if st_status: st_status.text("Fetching S&P 500 constituents...")
+    tickers, sector_map = fetch_sp500_constituents()
+
+    if st_status: st_status.text("Downloading market and macro data...")
+    prices, macro_data = fetch_market_data(tickers, START_DATE, END_DATE)
+
     fundamentals_cache = load_fundamentals_cache()
     features = engineer_features(prices, macro_data, sector_map, fundamentals_cache, st_status)
     save_fundamentals_cache(fundamentals_cache)
+    
     st_status.text("Training final model on all data...")
     X_train_list, y_train_list, X_pred_list, pred_tickers = [], [], [], []
     for ticker, df in features.items():
@@ -193,6 +204,7 @@ def run_live_prediction_pipeline(st_status):
     scaler = StandardScaler().fit(X_train)
     p50 = GradientBoostingRegressor(loss='quantile', alpha=0.5, n_estimators=100).fit(scaler.transform(X_train), y_train).predict(scaler.transform(X_pred))
     predictions_df = pd.DataFrame({'Ticker': pred_tickers, 'P50': p50}).set_index('Ticker')
+    
     st_status.text("Optimizing live portfolio...")
     watchlist = predictions_df[predictions_df['P50'] > 0.005].sort_values('P50', ascending=False).head(15)
     if len(watchlist) > 1:
@@ -203,4 +215,5 @@ def run_live_prediction_pipeline(st_status):
         if historical_cov_data.shape[0] > 10 and not historical_cov_data.isnull().values.any():
             optimal_weights = optimize_portfolio_weights(watchlist['P50'], historical_cov_data)
             return pd.DataFrame(optimal_weights, columns=['Weight'])
+            
     return pd.DataFrame()
