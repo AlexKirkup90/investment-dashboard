@@ -3,8 +3,7 @@
 # ==============================================================================
 # This version enhances the feature set with key macro-economic indicators
 # (CPI for inflation, PMI for economic health) to make the model regime-aware.
-# VERSION 10.1: Fixed "cannot pickle 'module' object" error by separating
-# st.status updates from cached functions.
+# VERSION 10.2: Added error handling for FRED data fetching to prevent crashes.
 # ==============================================================================
 
 import pandas as pd
@@ -56,7 +55,6 @@ def get_fundamentals(ticker, cache, st_status=None):
 # --- Data Fetching ---
 @memory.cache
 def fetch_sp500_constituents():
-    # This function IS cached, so we DO NOT pass the st_status object here.
     url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
     df_sp500 = pd.read_html(requests.get(url).text)[0]
     tickers = [t.replace('.', '-') for t in df_sp500['Symbol'].tolist()]
@@ -65,12 +63,18 @@ def fetch_sp500_constituents():
 
 @memory.cache
 def fetch_market_data(tickers, start, end):
-    # This function IS cached, so we DO NOT pass the st_status object here.
     all_tickers = tickers + ['SPY', '^VIX']
     prices = yf.download(all_tickers, start=start, end=end, auto_adjust=True, timeout=30)['Close']
     
-    macro_data = web.DataReader(['CPIAUCSL', 'ISM'], 'fred', start, end)
-    macro_data['CPI_YoY'] = macro_data['CPIAUCSL'].pct_change(12) * 100
+    # --- MODIFICATION START: Added error handling for FRED data ---
+    try:
+        macro_data = web.DataReader(['CPIAUCSL', 'ISM'], 'fred', start, end)
+        macro_data['CPI_YoY'] = macro_data['CPIAUCSL'].pct_change(12) * 100
+    except Exception as e:
+        print(f"Could not fetch FRED data. Continuing without macro features. Error: {e}")
+        # Create an empty dataframe with expected columns if the fetch fails
+        macro_data = pd.DataFrame(columns=['CPI_YoY', 'ISM'])
+    # --- MODIFICATION END ---
     
     return prices, macro_data
 
@@ -113,8 +117,14 @@ def engineer_features(prices, macro_data, sector_map, fundamentals_cache, st_sta
             fundamentals = get_fundamentals(ticker, fundamentals_cache, st_status)
             df['PE'], df['PB'], df['ROE'] = fundamentals['PE'], fundamentals['PB'], fundamentals['ROE']
             
-            df = df.join(macro_data[['CPI_YoY', 'ISM']].resample('M').last().shift(1))
-            df.fillna(method='ffill', inplace=True)
+            # --- MODIFICATION START: Check if macro data is available before joining ---
+            if not macro_data.empty:
+                df = df.join(macro_data[['CPI_YoY', 'ISM']].resample('M').last().shift(1))
+                df.fillna(method='ffill', inplace=True)
+            else:
+                df['CPI_YoY'] = 0
+                df['ISM'] = 0
+            # --- MODIFICATION END ---
 
             df['Target'] = ret.shift(-1)
             df.dropna(inplace=True)
@@ -166,7 +176,6 @@ def run_backtest_pipeline(st_status):
     START_DATE, END_DATE = '2013-01-01', datetime.today().strftime('%Y-%m-%d')
     VALIDATION_START_DATE = pd.to_datetime('2016-01-01')
     
-    # Call cached functions without the status object
     if st_status: st_status.text("Fetching S&P 500 constituents...")
     tickers, sector_map = fetch_sp500_constituents()
     
