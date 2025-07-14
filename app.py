@@ -3,6 +3,7 @@
 # ==============================================================================
 # This Streamlit app now runs the full backtest with the enhanced backend
 # and displays the final performance metrics and charts.
+# VERSION 8.1: Added a check to prevent TypeError if the backend fails.
 # ==============================================================================
 
 import streamlit as st
@@ -93,6 +94,8 @@ with st.sidebar:
                 st.session_state['model_run_completed'] = True
                 status.update(label="Backtest executed successfully!", state="complete", expanded=False)
             except Exception as e:
+                st.session_state['backtest_results'] = None # Ensure results are cleared on failure
+                st.session_state['model_run_completed'] = True
                 status.update(label=f"An error occurred: {e}", state="error", expanded=True)
 
     st.markdown("---")
@@ -104,12 +107,18 @@ st.title("Quantitative Model Dashboard")
 if not st.session_state['model_run_completed']:
     st.info("👈 Please click 'Run Full Backtest' in the sidebar to begin. This will take several minutes.")
 else:
-    results, prices = st.session_state['backtest_results']
-    if results is not None and not results.empty:
-        # Analyze and display the results
-        portfolio_df = analyze_backtest_results(results, prices)
-        
-        st.subheader("Raw Backtest Data")
-        st.dataframe(results)
+    # Check if the backtest results exist before trying to unpack them
+    if st.session_state['backtest_results'] is not None:
+        results, prices = st.session_state['backtest_results']
+        if not results.empty:
+            # Analyze and display the results
+            portfolio_df = analyze_backtest_results(results, prices)
+            
+            st.subheader("Raw Backtest Data")
+            st.dataframe(results)
+        else:
+            st.error("The backtest ran but did not produce any results.")
     else:
-        st.error("The backtest did not produce any results.")
+        # This message will now be shown if the pipeline failed
+        st.error("The model pipeline failed to run. Please check the logs or try again.")
+
