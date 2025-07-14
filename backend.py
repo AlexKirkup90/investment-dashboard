@@ -1,9 +1,8 @@
 # ==============================================================================
-# V8 - FINAL INTEGRATED ENGINE (BACKEND)
+# V10 - MACRO-AWARE ENGINE (BACKEND)
 # ==============================================================================
-# This is the definitive backend. It combines the Walk-Forward Validation
-# engine, the Portfolio Optimizer, and the enhanced Sector Momentum features
-# into a single, robust script.
+# This version enhances the feature set with key macro-economic indicators
+# (CPI for inflation, PMI for economic health) to make the model regime-aware.
 # ==============================================================================
 
 import pandas as pd
@@ -41,7 +40,6 @@ def save_fundamentals_cache(cache):
         json.dump(cache, f, indent=4)
 
 def get_fundamentals(ticker, cache, st_status=None):
-    """Fetches fundamentals with optional progress updates for Streamlit."""
     if ticker in cache: return cache[ticker]
     try:
         if st_status: st_status.text(f"Fetching fundamentals for {ticker}...")
@@ -65,14 +63,19 @@ def fetch_sp500_constituents(st_status=None):
 
 @memory.cache
 def fetch_market_data(tickers, start, end, st_status=None):
-    if st_status: st_status.text("Downloading market data...")
+    if st_status: st_status.text("Downloading market and macro data...")
     all_tickers = tickers + ['SPY', '^VIX']
     prices = yf.download(all_tickers, start=start, end=end, auto_adjust=True, timeout=30)['Close']
-    return prices
+    
+    # --- NEW: Fetch Macro Data ---
+    macro_data = web.DataReader(['CPIAUCSL', 'ISM'], 'fred', start, end)
+    # CPI is monthly, so we calculate Year-over-Year change
+    macro_data['CPI_YoY'] = macro_data['CPIAUCSL'].pct_change(12) * 100
+    
+    return prices, macro_data
 
 # --- Feature Engineering ---
-def engineer_features(prices, sector_map, fundamentals_cache, st_status=None):
-    """Engineers features for all historical data, including sector momentum."""
+def engineer_features(prices, macro_data, sector_map, fundamentals_cache, st_status=None):
     if st_status: st_status.text("Engineering features...")
     monthly_prices = prices.resample('M').last()
     monthly_returns = monthly_prices.pct_change()
@@ -110,6 +113,11 @@ def engineer_features(prices, sector_map, fundamentals_cache, st_status=None):
             fundamentals = get_fundamentals(ticker, fundamentals_cache, st_status)
             df['PE'], df['PB'], df['ROE'] = fundamentals['PE'], fundamentals['PB'], fundamentals['ROE']
             
+            # --- NEW: Add Macro Features ---
+            # Align macro data with our monthly feature dataframe
+            df = df.join(macro_data[['CPI_YoY', 'ISM']].resample('M').last().shift(1))
+            df.fillna(method='ffill', inplace=True) # Forward-fill to handle non-trading days
+
             df['Target'] = ret.shift(-1)
             df.dropna(inplace=True)
             if not df.empty: features_dict[ticker] = df
@@ -119,7 +127,6 @@ def engineer_features(prices, sector_map, fundamentals_cache, st_status=None):
 
 # --- Portfolio Optimization ---
 def optimize_portfolio_weights(expected_returns, historical_returns):
-    """Calculates optimal portfolio weights to maximize the Sharpe Ratio."""
     num_assets, cov_matrix = len(expected_returns), historical_returns.cov() * 12
     def neg_sharpe(weights):
         p_return = np.sum(expected_returns * weights) * 12
@@ -132,7 +139,6 @@ def optimize_portfolio_weights(expected_returns, historical_returns):
 
 # --- Walk-Forward Validation ---
 def run_walk_forward_validation(features_dict, validation_start_date, st_status=None):
-    """Runs the main walk-forward validation loop."""
     all_results = []
     prediction_dates = pd.to_datetime(sorted([d for d in list(features_dict.values())[0].index if d >= validation_start_date]))
     for i, prediction_date in enumerate(prediction_dates):
@@ -157,19 +163,44 @@ def run_walk_forward_validation(features_dict, validation_start_date, st_status=
         all_results.append(month_results)
     return pd.concat(all_results, ignore_index=True)
 
-# --- Main Orchestration Function ---
+# --- Main Orchestration Functions ---
 def run_backtest_pipeline(st_status):
-    """The main function called by the Streamlit app to run the full backtest."""
     START_DATE, END_DATE = '2013-01-01', datetime.today().strftime('%Y-%m-%d')
     VALIDATION_START_DATE = pd.to_datetime('2016-01-01')
-    
     tickers, sector_map = fetch_sp500_constituents(st_status)
-    prices = fetch_market_data(tickers, START_DATE, END_DATE, st_status)
+    prices, macro_data = fetch_market_data(tickers, START_DATE, END_DATE, st_status)
     fundamentals_cache = load_fundamentals_cache()
-    
-    features = engineer_features(prices, sector_map, fundamentals_cache, st_status)
+    features = engineer_features(prices, macro_data, sector_map, fundamentals_cache, st_status)
     save_fundamentals_cache(fundamentals_cache)
-    
     validation_results = run_walk_forward_validation(features, VALIDATION_START_DATE, st_status)
-    
     return validation_results, prices
+
+def run_live_prediction_pipeline(st_status):
+    START_DATE, END_DATE = '2013-01-01', datetime.today().strftime('%Y-%m-%d')
+    tickers, sector_map = fetch_sp500_constituents(st_status)
+    prices, macro_data = fetch_market_data(tickers, START_DATE, END_DATE, st_status)
+    fundamentals_cache = load_fundamentals_cache()
+    features = engineer_features(prices, macro_data, sector_map, fundamentals_cache, st_status)
+    save_fundamentals_cache(fundamentals_cache)
+    st_status.text("Training final model on all data...")
+    X_train_list, y_train_list, X_pred_list, pred_tickers = [], [], [], []
+    for ticker, df in features.items():
+        X_train_list.append(df.drop(columns='Target').values)
+        y_train_list.append(df['Target'].values)
+        X_pred_list.append(df.drop(columns='Target').iloc[-1].values)
+        pred_tickers.append(ticker)
+    X_train, y_train, X_pred = np.vstack(X_train_list), np.hstack(y_train_list), np.vstack(X_pred_list)
+    scaler = StandardScaler().fit(X_train)
+    p50 = GradientBoostingRegressor(loss='quantile', alpha=0.5, n_estimators=100).fit(scaler.transform(X_train), y_train).predict(scaler.transform(X_pred))
+    predictions_df = pd.DataFrame({'Ticker': pred_tickers, 'P50': p50}).set_index('Ticker')
+    st_status.text("Optimizing live portfolio...")
+    watchlist = predictions_df[predictions_df['P50'] > 0.005].sort_values('P50', ascending=False).head(15)
+    if len(watchlist) > 1:
+        hist_ret_for_cov = prices.resample('M').last().pct_change()
+        cov_end_date = hist_ret_for_cov.index[-1]
+        cov_start_date = cov_end_date - pd.DateOffset(months=12)
+        historical_cov_data = hist_ret_for_cov.loc[cov_start_date:cov_end_date][watchlist.index]
+        if historical_cov_data.shape[0] > 10 and not historical_cov_data.isnull().values.any():
+            optimal_weights = optimize_portfolio_weights(watchlist['P50'], historical_cov_data)
+            return pd.DataFrame(optimal_weights, columns=['Weight'])
+    return pd.DataFrame()
