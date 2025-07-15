@@ -1,7 +1,7 @@
-# backend.py — V12.5 “Diagnostics” Engine
+# backend.py — V12.6 “Fetch-Fix” Engine
 # ==============================================================================
-# Adds detailed logging & st_status messages to track where feature engineering
-# is dropping all tickers.
+# Removes the broken group_by logic and uses one yf.download() to grab
+# a multi-index DataFrame, then cleanly extracts Close/High/Low.
 # ==============================================================================
 
 import pandas as pd
@@ -82,15 +82,17 @@ def get_available_sectors():
 # --- Market + macro data ---
 @memory.cache
 def _fetch_data(tickers, start, end):
-    all_t = tickers + ["SPY","^VIX"]
-    raw = yf.download(all_t, start=start, end=end,
-                      auto_adjust=True, timeout=30, group_by="ticker")
-    closes = raw.xs("Close",axis=1,level=1)
-    highs  = raw.xs("High", axis=1,level=1)
-    lows   = raw.xs("Low",  axis=1,level=1)
+    # fetch one multi-index DataFrame: level 0=field, level1=ticker
+    df = yf.download(tickers + ["SPY","^VIX"], start=start, end=end,
+                     auto_adjust=True, timeout=30)
+    # extract each field
+    closes = df["Close"]
+    highs  = df["High"]
+    lows   = df["Low"]
+    # macro
     if web:
         try:
-            m = web.DataReader(["CPIAUCSL","ISM"],"fred",start, end)
+            m = web.DataReader(["CPIAUCSL","ISM"], "fred", start, end)
             m["CPI_YoY"] = m["CPIAUCSL"].pct_change(12)*100
             macro = m
         except Exception as e:
@@ -102,21 +104,20 @@ def _fetch_data(tickers, start, end):
 
 def fetch_data(tickers, start, end, st_status=None):
     if st_status:
-        st_status.text(f"Downloading market data for {len(tickers)} tickers…")
+        st_status.text(f"Downloading OHLC for {len(tickers)} tickers…")
     return _fetch_data(tickers, start, end)
 
 # --- Feature engineering ---
 def engineer_features(closes, highs, lows, macro, sector_map, fund_cache, st_status=None):
-    # Diagnostic: shapes
-    logging.info(f"Closes shape: {closes.shape}, Highs: {highs.shape}, Lows: {lows.shape}, Macro: {macro.shape}")
+    logging.info(f"Raw data shapes → closes:{closes.shape}, highs:{highs.shape}, lows:{lows.shape}, macro:{macro.shape}")
     if st_status:
-        st_status.text(f"Engineering features on {closes.shape[1]} tickers over {len(closes)} months…")
-    # resample
+        st_status.text(f"Engineering features on {closes.shape[1]} tickers, {len(closes)} rows…")
+    # monthly resample
     mclose = closes.resample("M").last()
     mret   = mclose.pct_change().dropna()
-    spyret = mret.get("SPY", pd.Series())
-    vix    = mclose.get("^VIX", pd.Series()).shift(1)
-    # MACD & Signal
+    spyret = mret["SPY"]
+    vix    = mclose["^VIX"].shift(1)
+    # MACD
     ema12 = mclose.ewm(span=12).mean()
     ema26 = mclose.ewm(span=26).mean()
     macd  = ema12 - ema26
@@ -133,37 +134,39 @@ def engineer_features(closes, highs, lows, macro, sector_map, fund_cache, st_sta
     plus  = (ph.diff().clip(lower=0)).ewm(alpha=1/14).mean()
     minus = (pl.diff().clip(upper=0)*-1).ewm(alpha=1/14).mean()
     adx   = ((plus - minus).abs()/(plus+minus+1e-9)*100).ewm(alpha=1/14).mean()
-    # Sector momentum
+    # sector momentum
     sec_srs = mret.groupby(pd.Series(sector_map), axis=1).mean()
     sec1    = sec_srs.rolling(1).mean()
+
     feats = {}
     for t in [c for c in mclose.columns if c not in ["SPY","^VIX"]]:
         if st_status:
             st_status.text(f" ➤ {t}")
         df = pd.DataFrame(index=mret.index)
-        df["M1"]        = mret[t].shift(1)
-        df["Vol3"]      = mret[t].rolling(3).std().shift(1)
-        df["Beta"]      = mret[t].rolling(12).cov(spyret).shift(1)/spyret.rolling(12).var() if not spyret.empty else np.nan
-        df["VIX"]       = vix
-        df["MACD"]      = macd[t]
+        df["M1"]         = mret[t].shift(1)
+        df["Vol3"]       = mret[t].rolling(3).std().shift(1)
+        df["Beta"]       = mret[t].rolling(12).cov(spyret).shift(1)/spyret.rolling(12).var()
+        df["VIX"]        = vix
+        df["MACD"]       = macd[t]
         df["MACD_Signal"]= sig[t]
-        df["ADX"]       = adx[t]
+        df["ADX"]        = adx[t]
         sec = sector_map.get(t)
-        df["SecMom1"]   = sec1.get(sec, pd.Series()).shift(1) if sec in sec1 else 0
-        df["SecRel1"]   = df["M1"] - df["SecMom1"]
-        f = fund_cache.get(t,{"PE":np.nan,"PB":np.nan,"ROE":np.nan})
-        df["PE"], df["PB"], df["ROE"] = f["PE"], f["PB"], f["ROE"]
+        df["SecMom1"]    = sec1[t] if t in sec1 else 0
+        df["SecRel1"]    = df["M1"] - df["SecMom1"]
+        f = fund_cache.get(t, {"PE":np.nan,"PB":np.nan,"ROE":np.nan})
+        df["PE"],df["PB"],df["ROE"] = f["PE"],f["PB"],f["ROE"]
         if not macro.empty:
             md = macro[["CPI_YoY","ISM"]].resample("M").last().shift(1)
             df = df.join(md).ffill()
         else:
-            df["CPI_YoY"], df["ISM"] = 0, 0
+            df["CPI_YoY"], df["ISM"] = 0,0
         df["Target"] = mret[t].shift(-1)
         df.dropna(inplace=True)
-        logging.debug(f"{t} → rows: {len(df)} features")
+        logging.debug(f"{t}: {df.shape[0]} rows")
         if not df.empty:
             feats[t] = df
-    logging.info(f"Feature count: {len(feats)}")
+
+    logging.info(f"Features built for {len(feats)} tickers")
     return feats
 
 # --- Optimizer ---
@@ -175,6 +178,7 @@ def optimize_weights(dfm, hist_ret, sector_map, maxw=0.25):
         r = w.dot(p50)*12
         v = np.sqrt(w.dot(cov).dot(w))
         return -r/(v+1e-9)
+    # constraints
     cons = [{"type":"eq","fun":lambda w:w.sum()-1}]
     inv = {}
     for i,t in enumerate(tickers):
@@ -193,11 +197,10 @@ def run_backtest_pipeline(st_status=None, start_date="2016-01-01"):
     val_start  = pd.to_datetime(start_date)
     ts, sector_map = fetch_sp500_constituents(st_status)
     closes, highs, lows, macro = fetch_data(ts, START, END, st_status)
-    # Diagnostic popup
     if st_status:
         st_status.text(f"Fetched data: {closes.shape[1]} tickers × {len(closes)} rows")
     if closes.empty:
-        raise RuntimeError("Market data empty after download")
+        raise RuntimeError("Market data empty")
     fund_cache = load_fund_cache()
     fund_cache = get_fundamentals_batch(ts, fund_cache, st_status)
     save_fund_cache(fund_cache)
@@ -206,11 +209,73 @@ def run_backtest_pipeline(st_status=None, start_date="2016-01-01"):
         st_status.text(f"{len(feats)} tickers survived feature engineering")
     if not feats:
         raise RuntimeError("No features generated—check backend.log for details")
-    # proceed...
+
     results = []
     dates = sorted([d for d in feats[next(iter(feats))].index if d>=val_start])
     for dt in dates:
-        # (same logic as before) ...
-        pass
-    # return a dummy so it compiles
-    return pd.DataFrame(), {}
+        Xtr, Ytr, Xte, actuals, tickers = [], [], [], [], []
+        for t, df in feats.items():
+            tr = df[df.index < dt]
+            if len(tr) >= 24:
+                Xtr.append(tr.drop("Target", axis=1).values)
+                Ytr.append(tr["Target"].values)
+            if dt in df.index:
+                row = df.loc[dt]
+                Xte.append(row.drop("Target", axis=1).values)
+                actuals.append(row["Target"])
+                tickers.append(t)
+        if not Xte:
+            continue
+        Xtr, Ytr, Xte = np.vstack(Xtr), np.hstack(Ytr), np.vstack(Xte)
+        mdl = XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=5)
+        S   = StandardScaler().fit(Xtr)
+        P50 = mdl.fit(S.transform(Xtr), Ytr).predict(S.transform(Xte))
+        dfm = pd.DataFrame({"Ticker": tickers, "P50": P50, "Actual": actuals}).set_index("Ticker")
+        hist= closes.resample("M").last().pct_change().loc[:dt].tail(12)[tickers]
+        w   = optimize_weights(dfm, hist, sector_map)
+        ret = w.dot(dfm["Actual"])
+        results.append({"Date": dt, "Return": ret})
+
+    out = pd.DataFrame(results).set_index("Date")
+    out["Cumulative"] = (1 + out["Return"]).cumprod()
+    ann    = out["Return"].mean()   *12
+    vol    = out["Return"].std()    *np.sqrt(12)
+    sharpe = ann/vol
+    mdd    = (1 - out["Cumulative"]/out["Cumulative"].cummax()).max()
+    return out, {"Sharpe":sharpe,"MaxDrawdown":mdd,"AnnualReturn":ann}
+
+# --- Live prediction ---
+def run_live_prediction_pipeline(st_status=None, selected_sectors=None, max_stock_weight=0.25):
+    START, END = "2013-01-01", datetime.today().strftime("%Y-%m-%d")
+    ts, sector_map = fetch_sp500_constituents(st_status)
+    if selected_sectors:
+        ts = [t for t in ts if sector_map[t] in selected_sectors]
+        sector_map = {t:sector_map[t] for t in ts}
+    closes, highs, lows, macro = fetch_data(ts, START, END, st_status)
+    fund_cache = load_fund_cache()
+    fund_cache = get_fundamentals_batch(ts, fund_cache, st_status)
+    save_fund_cache(fund_cache)
+    feats = engineer_features(closes, highs, lows, macro, sector_map, fund_cache, st_status)
+
+    Xtr, Ytr, Xp, idx = [], [], [], []
+    for t, df in feats.items():
+        Xtr.append(df.drop("Target",axis=1).values)
+        Ytr.append(df["Target"].values)
+        Xp.append(df.drop("Target",axis=1).iloc[-1].values)
+        idx.append(t)
+    if not Xtr:
+        return pd.DataFrame()
+    Xtr, Ytr, Xp = np.vstack(Xtr), np.hstack(Ytr), np.vstack(Xp)
+    mdl = XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=5)
+    S   = StandardScaler().fit(Xtr)
+    P50 = mdl.fit(S.transform(Xtr), Ytr).predict(S.transform(Xp))
+    dfm = pd.DataFrame({"Ticker":idx,"P50":P50}).set_index("Ticker")
+    cutoff = np.percentile(P50,90)
+    wdf    = dfm[dfm["P50"]>cutoff].sort_values("P50",ascending=False).head(15)
+    hist   = closes.resample("M").last().pct_change().tail(13).iloc[:-1]
+    cov    = hist[wdf.index].cov()*12
+    def ns(w): return -(w.dot(wdf["P50"])*12)/np.sqrt(w.dot(cov).dot(w)+1e-9)
+    cons=[{"type":"eq","fun":lambda w:w.sum()-1}]
+    bnds=[(0,max_stock_weight)]*len(wdf)
+    res = minimize(ns, np.ones(len(wdf))/len(wdf), bounds=bnds, constraints=cons)
+    return pd.Series(res.x,index=wdf.index).to_frame("Weight")
