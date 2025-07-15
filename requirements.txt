@@ -1,6 +1,7 @@
 # Core data & science
 pandas>=2.0
 numpy>=1.25
+lxml>=4.9.0
 
 # Market data
 yfinance>=0.2.65
@@ -22,5 +23,5 @@ scipy>=1.16.0
 streamlit>=1.46.1
 matplotlib>=3.10.3
 
-# FRED access (compatible up through 0.5.2 on Python 3.12)
+# FRED access
 fredapi>=0.5.2
