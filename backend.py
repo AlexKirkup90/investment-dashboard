@@ -1,9 +1,8 @@
 # ==============================================================================
 # V14 - DEFINITIVE ENGINE (BACKEND) - REPAIRED
 # ==============================================================================
-# This version fixes all critical faults, correctly implements the live
-# portfolio mode with user-defined parameters, and returns a clean, unified
-# results object for both backtesting and live predictions.
+# This version fixes all critical faults and is re-architected to be more
+# memory-efficient to prevent silent crashes on Streamlit Cloud.
 # ==============================================================================
 
 import pandas as pd
@@ -68,10 +67,9 @@ def fetch_market_data(tickers, start, end):
     raw_data = yf.download(all_tickers, start=start, end=end, auto_adjust=True, timeout=30)
     prices, highs, lows = raw_data['Close'], raw_data['High'], raw_data['Low']
     try:
-        # FIXED: Initialize FRED client safely using Streamlit secrets
         fred_api_key = st.secrets.get("FRED", {}).get("API_KEY")
         if not fred_api_key:
-            raise ValueError("FRED API key not found in secrets.toml. Please add it.")
+            raise ValueError("FRED API key not found in secrets.toml.")
         fred = Fred(api_key=fred_api_key)
         rates2 = fred.get_series("DGS2", start, end)
         rates10 = fred.get_series("DGS10", start, end)
@@ -98,7 +96,6 @@ def engineer_features(prices, highs, lows, yc_slope, sector_map, fundamentals_ca
     monthly_prices, monthly_highs, monthly_lows = prices.resample('M').last(), highs.resample('M').max(), lows.resample('M').min()
     monthly_returns, monthly_spy_returns = monthly_prices.pct_change(), monthly_prices['SPY'].pct_change()
     
-    # FIXED: Calculate sector momentum once, outside the loop
     ticker_to_sector = pd.Series(sector_map)
     sector_monthly_returns = monthly_returns.groupby(ticker_to_sector, axis=1).mean()
     sector_mom_1m = sector_monthly_returns.rolling(1).mean()
@@ -151,45 +148,13 @@ def optimize_portfolio_weights(expected_returns, historical_returns, sector_map,
     result = minimize(neg_sharpe, [1./num_assets]*num_assets, method='SLSQP', bounds=bounds, constraints=constraints)
     return pd.Series(result.x, index=expected_returns.index)
 
-def calculate_performance_metrics(results_df, prices, sector_map, risk_free_rate):
+# --- Walk-Forward Validation (Memory Efficient) ---
+def run_walk_forward_validation(features_dict, prices, sector_map, validation_start_date, risk_free_rate, st_status=None):
+    # FIXED: This function is now memory-efficient. It calculates returns month-by-month.
     portfolio_monthly_returns = []
     hist_ret_for_cov = prices.resample('M').last().pct_change()
-    for date in results_df['PredictionDate'].unique():
-        month_preds = results_df[results_df['PredictionDate'] == date].set_index('Ticker')
-        watchlist = month_preds[month_preds['P50'] > 0.005].sort_values('P50', ascending=False).head(15)
-        if len(watchlist) > 1:
-            cov_end_date, cov_start_date = date - pd.DateOffset(months=1), date - pd.DateOffset(months=13)
-            historical_cov_data = hist_ret_for_cov.loc[cov_start_date:cov_end_date][watchlist.index]
-            if historical_cov_data.shape[0] > 10 and not historical_cov_data.isnull().values.any():
-                optimal_weights = optimize_portfolio_weights(watchlist['P50'], historical_cov_data, sector_map, 0.25)
-                portfolio_return = np.dot(optimal_weights, watchlist['ActualReturn'])
-            else: portfolio_return = 0
-        else: portfolio_return = 0
-        portfolio_monthly_returns.append(portfolio_return)
-        
-    # FIXED: Renamed column to 'Return' to match app.py expectation
-    portfolio_df = pd.DataFrame({'Date': pd.to_datetime(results_df['PredictionDate'].unique()), 'Return': portfolio_monthly_returns}).set_index('Date')
-    
-    spy_monthly_returns = prices['SPY'].resample('M').last().pct_change()
-    portfolio_df['SPY_Return'] = spy_monthly_returns.reindex(portfolio_df.index)
-    portfolio_df.dropna(inplace=True)
-    
-    # FIXED: All calculations are now done in the backend
-    portfolio_df['Cumulative'] = (1 + portfolio_df['Return']).cumprod()
-    portfolio_df['SPY_Cumulative'] = (1 + portfolio_df['SPY_Return']).cumprod()
-    portfolio_df['Drawdown'] = 1 - portfolio_df['Cumulative'] / portfolio_df['Cumulative'].cummax()
-    
-    metrics = {}
-    metrics['Sharpe'] = ((portfolio_df['Return'].mean() * 12 - risk_free_rate) / (portfolio_df['Return'].std() * np.sqrt(12)))
-    metrics['MaxDrawdown'] = portfolio_df['Drawdown'].max()
-    metrics['AnnualReturn'] = portfolio_df['Return'].mean() * 12
-    
-    return portfolio_df, metrics
-
-# --- Walk-Forward Validation ---
-def run_walk_forward_validation(features_dict, validation_start_date, st_status=None):
-    all_results = []
     prediction_dates = pd.to_datetime(sorted([d for d in list(features_dict.values())[0].index if d >= pd.to_datetime(validation_start_date)]))
+    
     for i, prediction_date in enumerate(prediction_dates):
         if st_status: st_status.text(f"Running backtest for {prediction_date.strftime('%Y-%m')} ({i+1}/{len(prediction_dates)})...")
         train_end_date = prediction_date - relativedelta(months=1)
@@ -204,38 +169,63 @@ def run_walk_forward_validation(features_dict, validation_start_date, st_status=
                 X_test.append(test_row.drop('Target').values)
                 actuals.append(test_row['Target'])
                 tickers.append(ticker)
-        if not X_test or not X_train: continue
+        
+        if not X_test or not X_train:
+            portfolio_monthly_returns.append(0)
+            continue
+            
         X_train, y_train, X_test = np.vstack(X_train), np.hstack(y_train), np.vstack(X_test)
         scaler = StandardScaler().fit(X_train)
         p50 = GradientBoostingRegressor(loss='quantile', alpha=0.5, n_estimators=100).fit(scaler.transform(X_train), y_train).predict(scaler.transform(X_test))
-        month_results = pd.DataFrame({'PredictionDate': prediction_date, 'Ticker': tickers, 'P50': p50, 'ActualReturn': actuals})
-        all_results.append(month_results)
-    return pd.concat(all_results, ignore_index=True)
+        
+        month_preds = pd.DataFrame({'Ticker': tickers, 'P50': p50, 'ActualReturn': actuals}).set_index('Ticker')
+        watchlist = month_preds[month_preds['P50'] > 0.005].sort_values('P50', ascending=False).head(15)
+        
+        if len(watchlist) > 1:
+            cov_end_date, cov_start_date = prediction_date - pd.DateOffset(months=1), prediction_date - pd.DateOffset(months=13)
+            historical_cov_data = hist_ret_for_cov.loc[cov_start_date:cov_end_date][watchlist.index]
+            if historical_cov_data.shape[0] > 10 and not historical_cov_data.isnull().values.any():
+                optimal_weights = optimize_portfolio_weights(watchlist['P50'], historical_cov_data, sector_map, 0.25)
+                portfolio_return = np.dot(optimal_weights, watchlist['ActualReturn'])
+            else: portfolio_return = 0
+        else: portfolio_return = 0
+        portfolio_monthly_returns.append(portfolio_return)
+
+    portfolio_df = pd.DataFrame({'Date': prediction_dates, 'Return': portfolio_monthly_returns}).set_index('Date')
+    spy_monthly_returns = prices['SPY'].resample('M').last().pct_change()
+    portfolio_df['SPY_Return'] = spy_monthly_returns.reindex(portfolio_df.index)
+    portfolio_df.dropna(inplace=True)
+    
+    portfolio_df['Cumulative'] = (1 + portfolio_df['Return']).cumprod()
+    portfolio_df['SPY_Cumulative'] = (1 + portfolio_df['SPY_Return']).cumprod()
+    portfolio_df['Drawdown'] = 1 - portfolio_df['Cumulative'] / portfolio_df['Cumulative'].cummax()
+    
+    metrics = {}
+    metrics['Sharpe'] = ((portfolio_df['Return'].mean() * 12 - risk_free_rate) / (portfolio_df['Return'].std() * np.sqrt(12)))
+    metrics['MaxDrawdown'] = portfolio_df['Drawdown'].max()
+    metrics['AnnualReturn'] = portfolio_df['Return'].mean() * 12
+    
+    return portfolio_df, metrics
 
 # --- Main Orchestration Functions ---
 def run_backtest_pipeline(st_status, start_date, risk_free_rate):
-    # FIXED: Now returns the two objects app.py expects
     END_DATE = datetime.today().strftime('%Y-%m-%d')
     tickers, sector_map = fetch_sp500_constituents()
     prices, highs, lows, yc_slope = fetch_market_data(tickers, '2013-01-01', END_DATE)
     fundamentals_cache = load_fundamentals_cache()
     features = engineer_features(prices, highs, lows, yc_slope, sector_map, fundamentals_cache, st_status)
     save_fundamentals_cache(fundamentals_cache)
-    validation_results = run_walk_forward_validation(features, start_date, st_status)
-    if validation_results.empty:
-        return pd.DataFrame(), {}
-    portfolio_df, metrics = calculate_performance_metrics(validation_results, prices, sector_map, risk_free_rate)
+    
+    # The main validation function now also calculates performance
+    portfolio_df, metrics = run_walk_forward_validation(features, prices, sector_map, start_date, risk_free_rate, st_status)
+    
     return portfolio_df, metrics
 
 def run_live_prediction_pipeline(st_status, selected_sectors, max_stock_weight):
-    # FIXED: Now correctly handles user inputs
     END_DATE = datetime.today().strftime('%Y-%m-%d')
     tickers, sector_map = fetch_sp500_constituents()
-
-    # Filter tickers based on user selection
     if selected_sectors:
         tickers = [t for t in tickers if sector_map.get(t) in selected_sectors]
-
     prices, highs, lows, yc_slope = fetch_market_data(tickers, '2013-01-01', END_DATE)
     fundamentals_cache = load_fundamentals_cache()
     features = engineer_features(prices, highs, lows, yc_slope, sector_map, fundamentals_cache, st_status)
@@ -251,7 +241,6 @@ def run_live_prediction_pipeline(st_status, selected_sectors, max_stock_weight):
             pred_tickers.append(ticker)
     
     if not X_pred_list: return pd.DataFrame()
-
     X_train, y_train, X_pred = np.vstack(X_train_list), np.hstack(y_train_list), np.vstack(X_pred_list)
     scaler = StandardScaler().fit(X_train)
     p50 = GradientBoostingRegressor(loss='quantile', alpha=0.5, n_estimators=100).fit(scaler.transform(X_train), y_train).predict(scaler.transform(X_pred))
@@ -269,6 +258,5 @@ def run_live_prediction_pipeline(st_status, selected_sectors, max_stock_weight):
     return pd.DataFrame()
 
 def get_available_sectors():
-    # FIXED: Added the missing function
     _, sector_map = fetch_sp500_constituents()
     return sorted(list(set(sector_map.values())))
