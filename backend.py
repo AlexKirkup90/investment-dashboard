@@ -23,8 +23,7 @@ logging.basicConfig(filename='app.log', level=logging.INFO)
 # --- Setup Caching ---
 CACHE_DIR = "model_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
-memory = joblib.Memory(CACHE_DIR, verbose=0)
-FUNDAMENTALS_CACHE_FILE = os.path.join(CACHE_DIR, 'fundamentals_cache.json')
+# Removed @memory.cache from functions to avoid pickling issues with parallel execution
 
 # --- Caching Functions ---
 def load_fundamentals_cache():
@@ -63,7 +62,6 @@ def get_fundamentals_batch(tickers, cache, st_status=None):
     return cache
 
 # --- Data Fetching ---
-@memory.cache
 def fetch_sp500_constituents(st_status=None):
     if st_status:
         st_status.text("Fetching S&P 500 constituents...")
@@ -77,7 +75,6 @@ def fetch_sp500_constituents(st_status=None):
         logging.error(f"Failed to fetch S&P 500 constituents: {e}")
         return [], {}
 
-@memory.cache
 def fetch_market_data(tickers, start, end, st_status=None):
     if st_status:
         st_status.text("Downloading market and macro data...")
