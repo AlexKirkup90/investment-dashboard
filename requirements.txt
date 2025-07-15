@@ -1,21 +1,14 @@
-# Core data & ML
 pandas>=2.3.1
 numpy>=2.3.1
 scikit-learn>=1.7.0
 xgboost>=3.0.2
 scipy>=1.16.0
 joblib>=1.5.1
-
-# Data sources
 yfinance>=0.2.65
-fredapi>=0.7.0           # Replaces pandas-datareader for FRED series
+fredapi>=0.7.0
 requests>=2.32.4
-
-# App & plotting
 streamlit>=1.46.1
 matplotlib>=3.10.3
-
-# Utilities
-setuptools>=65.0.0       # ensures packaging tools are available
 python-dateutil>=2.9.0
 pytz>=2025.2
+setuptools>=65.0.0
