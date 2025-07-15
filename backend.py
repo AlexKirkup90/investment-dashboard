@@ -1,3 +1,12 @@
+# backend.py — V12.2 “Parallel-free” Engine
+# ==============================================================================
+# Drops joblib.Parallel to avoid pickle errors; full serial feature engineering.
+# Fully aligned with your app.py:
+#  - get_available_sectors()
+#  - run_backtest_pipeline(st_status, start_date) → (df, metrics)
+#  - run_live_prediction_pipeline(st_status, selected_sectors, max_stock_weight) → DataFrame(Weight)
+# ==============================================================================
+
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -37,9 +46,11 @@ def save_fund_cache(c):
 def get_fundamentals_batch(tickers, cache, st_status=None):
     """Fetch & cache fundamentals for all tickers via yfinance."""
     for t in tickers:
-        if t in cache: continue
+        if t in cache:
+            continue
         try:
-            if st_status: st_status.text(f"Fetching fundamentals for {t}...")
+            if st_status:
+                st_status.text(f"Fetching fundamentals for {t}...")
             info = yf.Ticker(t).info
             cache[t] = {
                 "PE": info.get("trailingPE", np.nan),
@@ -66,7 +77,8 @@ def get_available_sectors():
 @memory.cache
 def fetch_data(tickers, start, end, _=None):
     all_t = tickers + ["SPY","^VIX"]
-    raw = yf.download(all_t, start=start, end=end, auto_adjust=True, timeout=30, group_by="ticker")
+    raw = yf.download(all_t, start=start, end=end, auto_adjust=True,
+                      timeout=30, group_by="ticker")
     closes = raw.xs("Close",axis=1,level=1)
     highs  = raw.xs("High", axis=1,level=1)
     lows   = raw.xs("Low",  axis=1,level=1)
@@ -82,9 +94,11 @@ def fetch_data(tickers, start, end, _=None):
         macro = pd.DataFrame()
     return closes, highs, lows, macro
 
-# --- Feature engineering (vectorized) ---
+# --- Feature engineering (serial) ---
 def engineer_features(closes, highs, lows, macro, sector_map, fund_cache, st_status=None):
-    # Monthly
+    if st_status:
+        st_status.text("Engineering features...")
+    # Monthly resample
     mclose = closes.resample("M").last()
     mret   = mclose.pct_change().dropna()
     spyret = mret["SPY"]
@@ -108,17 +122,18 @@ def engineer_features(closes, highs, lows, macro, sector_map, fund_cache, st_sta
     adx  = ((plus - minus).abs()/(plus+minus+1e-9)*100).ewm(alpha=1/14).mean()
     # Sector momentum
     sec_srs = mret.groupby(pd.Series(sector_map), axis=1).mean()
-    sec1 = sec_srs.rolling(1).mean()
+    sec1    = sec_srs.rolling(1).mean()
     # Build per-ticker DataFrames
     feats = {}
     for t in [c for c in mclose.columns if c not in ["SPY","^VIX"]]:
-        if st_status: st_status.text(f"Engineering features for {t}...")
+        if st_status:
+            st_status.text(f"Engineering features for {t}...")
         df = pd.DataFrame(index=mret.index)
         # Momentum/Vol/Beta/VIX
-        df["M1"]     = mret[t].shift(1)
-        df["Vol3"]   = mret[t].rolling(3).std().shift(1)
-        df["Beta"]   = mret[t].rolling(12).cov(spyret).shift(1)/spyret.rolling(12).var()
-        df["VIX"]    = vix
+        df["M1"]   = mret[t].shift(1)
+        df["Vol3"] = mret[t].rolling(3).std().shift(1)
+        df["Beta"] = mret[t].rolling(12).cov(spyret).shift(1)/spyret.rolling(12).var()
+        df["VIX"]  = vix
         # Tech
         df["MACD"]        = macd[t]
         df["MACD_Signal"] = sig[t]
@@ -143,7 +158,30 @@ def engineer_features(closes, highs, lows, macro, sector_map, fund_cache, st_sta
             feats[t] = df
     return feats
 
-# --- Backtest & live pipelines go here ---
+
+# --- Optimizer with sector caps ---
+def optimize_weights(dfm, hist_ret, sector_map, maxw=0.25):
+    tickers = dfm.index.tolist()
+    p50 = dfm["P50"]
+    cov = hist_ret.cov()*12
+    def neg_sh(w):
+        r = w.dot(p50)*12
+        v = np.sqrt(w.dot(cov).dot(w))
+        return -r/(v+1e-9)
+    cons = [{"type":"eq","fun":lambda x:x.sum()-1}]
+    # 30% per sector
+    inv = {sec:[] for sec in set(sector_map.values())}
+    for i,t in enumerate(tickers):
+        inv[sector_map.get(t)].append(i)
+    for inds in inv.values():
+        cons.append({"type":"ineq","fun":lambda w,i=inds:0.30 - w[i].sum()})
+    bnds = [(0,maxw)]*len(tickers)
+    res  = minimize(neg_sh, np.ones(len(tickers))/len(tickers),
+                    bounds=bnds, constraints=cons)
+    return pd.Series(res.x,index=tickers)
+
+
+# --- Walk‐forward backtest ---
 def run_backtest_pipeline(st_status=None, start_date="2016-01-01"):
     START, END = "2013-01-01", datetime.today().strftime("%Y-%m-%d")
     val_start = pd.to_datetime(start_date)
@@ -155,12 +193,11 @@ def run_backtest_pipeline(st_status=None, start_date="2016-01-01"):
     fund_cache = get_fundamentals_batch(ts, fund_cache, st_status)
     save_fund_cache(fund_cache)
     feats = engineer_features(closes, highs, lows, macro, sector_map, fund_cache, st_status)
-    # Walk-forward
-    all_res, prev_w = [], pd.Series()
-    dates = [d for d in feats[next(iter(feats))].index if d>=val_start]
+
+    results, prev_w = [], pd.Series()
+    dates = sorted([d for d in feats[next(iter(feats))].index if d>=val_start])
     for dt in dates:
-        # assemble
-        Xtr, Ytr, Xte, actuals, tickers = [],[],[],[],[]
+        Xtr, Ytr, Xte, actuals, tickers = [], [], [], [], []
         for t,df in feats.items():
             tr = df[df.index<dt]
             if len(tr)>=24:
@@ -168,32 +205,32 @@ def run_backtest_pipeline(st_status=None, start_date="2016-01-01"):
                 Ytr.append(tr["Target"].values)
             if dt in df.index:
                 row = df.loc[dt]
-                Xte.append(row.drop("Target").values)
+                Xte.append(row.drop("Target",1).values)
                 actuals.append(row["Target"])
                 tickers.append(t)
-        if not Xte: continue
-        Xtr = np.vstack(Xtr); Ytr = np.hstack(Ytr)
-        Xte = np.vstack(Xte)
-        # model
-        mdl = XGBRegressor(n_estimators=100,learning_rate=0.1, max_depth=5)
+        if not Xte:
+            continue
+        Xtr, Ytr, Xte = np.vstack(Xtr), np.hstack(Ytr), np.vstack(Xte)
+        mdl = XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=5)
         S   = StandardScaler().fit(Xtr)
         P50 = mdl.fit(S.transform(Xtr),Ytr).predict(S.transform(Xte))
-        # opt
         dfm = pd.DataFrame({"Ticker":tickers,"P50":P50,"Actual":actuals}).set_index("Ticker")
         hist = closes.resample("M").last().pct_change().loc[:dt].tail(12)[tickers]
-        w    = optimize_weights(dfm,hist,sector_map)
+        w    = optimize_weights(dfm, hist, sector_map)
         prev_w = w
         ret  = w.dot(dfm["Actual"])
-        all_res.append({"Date":dt,"Return":ret})
-    out = pd.DataFrame(all_res).set_index("Date")
+        results.append({"Date":dt,"Return":ret})
+    out = pd.DataFrame(results).set_index("Date")
     out["Cumulative"] = (1+out["Return"]).cumprod()
     # metrics
-    ann = out["Return"].mean()*12
-    vol = out["Return"].std()*np.sqrt(12)
+    ann    = out["Return"].mean()*12
+    vol    = out["Return"].std()*np.sqrt(12)
     sharpe = ann/vol
-    mdd = (1 - out["Cumulative"]/out["Cumulative"].cummax()).max()
+    mdd    = (1-out["Cumulative"]/out["Cumulative"].cummax()).max()
     return out, {"Sharpe":sharpe,"MaxDrawdown":mdd,"AnnualReturn":ann}
 
+
+# --- Live prediction ---
 def run_live_prediction_pipeline(st_status=None, selected_sectors=None, max_stock_weight=0.25):
     START, END = "2013-01-01", datetime.today().strftime("%Y-%m-%d")
     ts, sector_map = fetch_sp500_constituents(st_status)
@@ -205,8 +242,8 @@ def run_live_prediction_pipeline(st_status=None, selected_sectors=None, max_stoc
     fund_cache = get_fundamentals_batch(ts, fund_cache, st_status)
     save_fund_cache(fund_cache)
     feats = engineer_features(closes, highs, lows, macro, sector_map, fund_cache, st_status)
-    # last‐month prediction
-    Xtr,Ytr,Xp,tcks = [],[],[],[]
+
+    Xtr, Ytr, Xp, tcks = [], [], [], []
     for t,df in feats.items():
         Xtr.append(df.drop("Target",1).values)
         Ytr.append(df["Target"].values)
@@ -214,22 +251,17 @@ def run_live_prediction_pipeline(st_status=None, selected_sectors=None, max_stoc
         tcks.append(t)
     if not Xtr:
         return pd.DataFrame()
-    Xtr = np.vstack(Xtr); Ytr=np.hstack(Ytr); Xp=np.vstack(Xp)
+    Xtr, Ytr, Xp = np.vstack(Xtr), np.hstack(Ytr), np.vstack(Xp)
     mdl = XGBRegressor(n_estimators=100,learning_rate=0.1,max_depth=5)
     S   = StandardScaler().fit(Xtr)
     P50 = mdl.fit(S.transform(Xtr),Ytr).predict(S.transform(Xp))
     dfm = pd.DataFrame({"Ticker":tcks,"P50":P50}).set_index("Ticker")
-    # pick top decile
     cutoff = np.percentile(P50,90)
-    wdf = dfm[dfm["P50"]>cutoff].sort_values("P50",ascending=False).head(15)
-    # optimize on last 12mo
-    hist = closes.resample("M").last().pct_change().tail(13).iloc[:-1]
-    cov  = hist[wdf.index].cov()*12
-    def neg_sh(w): 
-        r = w.dot(wdf["P50"])*12
-        v = np.sqrt(w.dot(cov).dot(w))
-        return -r/(v+1e-9)
-    cons = [{"type":"eq","fun":lambda w:w.sum()-1}]
-    bnds = [(0,max_stock_weight)]*len(wdf)
-    res = minimize(neg_sh, np.ones(len(wdf))/len(wdf), bounds=bnds, constraints=cons)
+    wdf   = dfm[dfm["P50"]>cutoff].sort_values("P50",ascending=False).head(15)
+    hist  = closes.resample("M").last().pct_change().tail(13).iloc[:-1]
+    cov   = hist[wdf.index].cov()*12
+    def neg_sh(w): return -(w.dot(wdf["P50"])*12)/np.sqrt(w.dot(cov).dot(w)+1e-9)
+    cons  = [{"type":"eq","fun":lambda w: w.sum()-1}]
+    bnds  = [(0,max_stock_weight)]*len(wdf)
+    res   = minimize(neg_sh, np.ones(len(wdf))/len(wdf), bounds=bnds, constraints=cons)
     return pd.Series(res.x,index=wdf.index).to_frame("Weight")
