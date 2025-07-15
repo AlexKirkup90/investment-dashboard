@@ -23,7 +23,7 @@ logging.basicConfig(filename='app.log', level=logging.INFO)
 # --- Setup Caching ---
 CACHE_DIR = "model_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
-# Removed @memory.cache from functions to avoid pickling issues with parallel execution
+FUNDAMENTALS_CACHE_FILE = os.path.join(CACHE_DIR, 'fundamentals_cache.json')  # Added missing constant
 
 # --- Caching Functions ---
 def load_fundamentals_cache():
@@ -274,75 +274,3 @@ def calculate_performance_metrics(results_df, prices, sector_map, max_stock_weig
 def get_available_sectors():
     _, sector_map = fetch_sp500_constituents()
     return list(set(sector_map.values()))
-
-def run_backtest_pipeline(st_status=None, start_date='2016-01-01'):
-    START_DATE, END_DATE = '2013-01-01', datetime.today().strftime('%Y-%m-%d')
-    VALIDATION_START_DATE = pd.to_datetime(start_date)
-    
-    logging.info(f"Starting backtest for {VALIDATION_START_DATE} to {END_DATE}")
-    tickers, sector_map = fetch_sp500_constituents(st_status)
-    prices, highs, lows, macro_data = fetch_market_data(tickers, START_DATE, END_DATE, st_status)
-    if prices.empty:
-        raise ValueError("Failed to fetch market data")
-    
-    fundamentals_cache = load_fundamentals_cache()
-    fundamentals_cache = get_fundamentals_batch(tickers, fundamentals_cache, st_status)
-    features = engineer_features(prices, highs, lows, macro_data, sector_map, fundamentals_cache, st_status)
-    save_fundamentals_cache(fundamentals_cache)
-    
-    validation_results = run_walk_forward_validation(features, VALIDATION_START_DATE, st_status)
-    portfolio_df, metrics = calculate_performance_metrics(validation_results, prices, sector_map)
-    
-    return portfolio_df, metrics
-
-def run_live_prediction_pipeline(st_status=None, selected_sectors=None, max_stock_weight=0.25):
-    START_DATE, END_DATE = '2013-01-01', datetime.today().strftime('%Y-%m-%d')
-    
-    logging.info(f"Starting live prediction at {END_DATE}")
-    tickers, sector_map = fetch_sp500_constituents(st_status)
-    if selected_sectors:
-        tickers = [t for t in tickers if sector_map.get(t) in selected_sectors]
-        sector_map = {t: sector_map[t] for t in tickers}
-    
-    prices, highs, lows, macro_data = fetch_market_data(tickers, START_DATE, END_DATE, st_status)
-    if prices.empty:
-        raise ValueError("Failed to fetch market data")
-    
-    fundamentals_cache = load_fundamentals_cache()
-    fundamentals_cache = get_fundamentals_batch(tickers, fundamentals_cache, st_status)
-    features = engineer_features(prices, highs, lows, macro_data, sector_map, fundamentals_cache, st_status)
-    save_fundamentals_cache(fundamentals_cache)
-    
-    st_status.text("Training final model on all data...")
-    X_train_list, y_train_list, X_pred_list, pred_tickers = [], [], [], []
-    for ticker, df in features.items():
-        X_train_list.append(df.drop(columns='Target').values)
-        y_train_list.append(df['Target'].values)
-        X_pred_list.append(df.drop(columns='Target').iloc[-1].values)
-        pred_tickers.append(ticker)
-    
-    if not X_train_list:
-        return pd.DataFrame()
-    
-    X_train, y_train, X_pred = np.vstack(X_train_list), np.hstack(y_train_list), np.vstack(X_pred_list)
-    scaler = StandardScaler().fit(X_train)
-    model = XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=5)
-    p50 = model.fit(scaler.transform(X_train), y_train).predict(scaler.transform(X_pred))
-    
-    predictions_df = pd.DataFrame({'Ticker': pred_tickers, 'P50': p50}).set_index('Ticker')
-    
-    st_status.text("Optimizing live portfolio...")
-    watchlist = predictions_df[predictions_df['P50'] > np.percentile(predictions_df['P50'], 90)].sort_values('P50', ascending=False).head(15)
-    
-    if len(watchlist) > 1:
-        hist_ret_for_cov = prices.resample('M').last().pct_change()
-        cov_end_date = hist_ret_for_cov.index[-1]
-        cov_start_date = cov_end_date - pd.DateOffset(months=12)
-        historical_cov_data = hist_ret_for_cov.loc[cov_start_date:cov_end_date][watchlist.index]
-        
-        if historical_cov_data.shape[0] > 10 and not historical_cov_data.isnull().values.any():
-            optimal_weights = optimize_portfolio_weights(watchlist['P50'], historical_cov_data, sector_map, max_stock_weight)
-            final_portfolio = pd.DataFrame(optimal_weights, columns=['Weight'])
-            return final_portfolio
-    
-    return pd.DataFrame()
