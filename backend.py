@@ -1,268 +1,353 @@
-# backend.py — V12.7 “fredapi & Single-Download” Engine
-import os, json, logging
+# backend.py
+"""
+Backend logic for the Quantitative Model Dashboard.
+
+Provides:
+- Data fetching (S&P 500, market OHLC, VIX, yield curve via FRED)
+- Feature engineering (technicals, sector momentum, fundamentals)
+- Walk‐forward backtest engine
+- Live portfolio construction engine
+- Portfolio optimization with sector and weight constraints
+"""
+
+import os
+import json
+import logging
+import warnings
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 
-import numpy as np
 import pandas as pd
+import numpy as np
+import requests
 import yfinance as yf
+import streamlit as st
 from fredapi import Fred
-from xgboost import XGBRegressor
 from scipy.optimize import minimize
 from sklearn.preprocessing import StandardScaler
-import joblib
-import warnings
+from xgboost import XGBRegressor
+from joblib import Memory, Parallel, delayed
 
+# Suppress warnings
 warnings.filterwarnings("ignore")
-logging.basicConfig(filename="backend.log", level=logging.DEBUG,
-                    format="%(asctime)s %(levelname)s %(message)s")
 
-# ─── CACHE SETUP ──────────────────────────────────────────────────────────────
-CACHE_DIR = "model_cache"
+# Setup logging
+logging.basicConfig(filename='backend.log', level=logging.INFO,
+                    format='%(asctime)s %(levelname)s %(message)s')
+
+# Setup disk caching for yfinance/FRED calls
+CACHE_DIR = "backend_cache"
+memory = Memory(CACHE_DIR, verbose=0)
+
+# Fundamentals cache file
+FUND_CACHE = os.path.join(CACHE_DIR, "fundamentals.json")
 os.makedirs(CACHE_DIR, exist_ok=True)
-memory = joblib.Memory(CACHE_DIR, verbose=0)
-FUND_FILE = os.path.join(CACHE_DIR, "fundamentals.json")
 
+# Initialize FRED client using Streamlit secrets
+fred = Fred(api_key=st.secrets["FRED"]["API_KEY"])
+
+
+# ─── Utility / Caching for Fundamentals ────────────────────────────────────────
 def load_fund_cache():
-    if os.path.exists(FUND_FILE):
-        return json.load(open(FUND_FILE))
+    if os.path.exists(FUND_CACHE):
+        with open(FUND_CACHE, "r") as f:
+            return json.load(f)
     return {}
 
-def save_fund_cache(c):
-    json.dump(c, open(FUND_FILE, "w"), indent=2)
+def save_fund_cache(cache):
+    with open(FUND_CACHE, "w") as f:
+        json.dump(cache, f, indent=2)
 
-# ─── S&P 500 CONSTITUENTS ────────────────────────────────────────────────────
+def get_fundamentals(ticker, cache, st_status=None):
+    """Fetch trailing PE, PB, ROE for a ticker, with local JSON caching."""
+    if ticker in cache:
+        return cache[ticker]
+    try:
+        if st_status: st_status.text(f"Fetching fundamentals for {ticker}…")
+        info = yf.Ticker(ticker).info
+        data = {
+            "PE": info.get("trailingPE", np.nan),
+            "PB": info.get("priceToBook", np.nan),
+            "ROE": info.get("returnOnEquity", np.nan)
+        }
+    except Exception as e:
+        logging.warning(f"Fundamentals fetch failed for {ticker}: {e}")
+        data = {"PE": np.nan, "PB": np.nan, "ROE": np.nan}
+    cache[ticker] = data
+    return data
+
+def batch_fundamentals(tickers, cache, st_status=None):
+    """Ensure fundamentals are cached for all tickers."""
+    for t in tickers:
+        if t not in cache:
+            get_fundamentals(t, cache, st_status)
+    return cache
+
+
+# ─── 1. Fetch S&P 500 Constituents ─────────────────────────────────────────────
 @memory.cache
 def fetch_sp500_constituents():
-    df = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
+    """Returns list of tickers and sector mapping from Wikipedia."""
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    df = pd.read_html(requests.get(url).text)[0]
     tickers = [s.replace(".", "-") for s in df.Symbol]
     sector_map = dict(zip(tickers, df["GICS Sector"]))
     return tickers, sector_map
 
+
+# ─── 2. Fetch Market & Regime Data ──────────────────────────────────────────────
+@memory.cache
+def fetch_market_data(start: str, end: str):
+    """
+    Downloads OHLC for S&P 500 + SPY + VIX and computes monthly VIX & yield‐curve slope.
+    """
+    tickers, _ = fetch_sp500_constituents()
+    all_syms = tickers + ["SPY", "^VIX"]
+    df = yf.download(all_syms, start=start, end=end, auto_adjust=True, timeout=30)
+
+    prices = df["Close"]
+    highs  = df["High"]
+    lows   = df["Low"]
+
+    # monthly VIX
+    monthly_vix = prices["^VIX"].resample("M").last()
+
+    # yield curve slope via FRED
+    rates2  = fred.get_series("DGS2", start, end)
+    rates10 = fred.get_series("DGS10", start, end)
+    ycs    = (rates10 - rates2).dropna()
+    monthly_yc = ycs.resample("M").last()
+
+    return prices, highs, lows, monthly_vix, monthly_yc
+
+
+# ─── 3. Feature Engineering ─────────────────────────────────────────────────────
+def engineer_features_single(ticker, prices, highs, lows, monthly_vix, monthly_yc, sector_map, fund_cache, st_status=None):
+    """Compute features & target for one ticker; return (ticker, df)."""
+    try:
+        # monthly series
+        prc_m = prices[ticker].resample("M").last()
+        ret_m = prc_m.pct_change()
+        vix_m = monthly_vix.shift(1)
+        yc_s   = monthly_yc.shift(1)
+
+        df = pd.DataFrame(index=ret_m.index)
+        # momentum
+        df["M1"]  = ret_m.shift(1)
+        df["M3"]  = ret_m.rolling(3).mean().shift(1)
+        df["M6"]  = ret_m.rolling(6).mean().shift(1)
+        df["M12"] = ret_m.rolling(12).mean().shift(1)
+        # volatility
+        df["Vol3"] = ret_m.rolling(3).std().shift(1)
+        # beta
+        spy_m = prices["SPY"].resample("M").last().pct_change()
+        df["Beta"] = ret_m.rolling(12).cov(spy_m).shift(1) / spy_m.rolling(12).var().shift(1)
+        # regime
+        df["VIX"]     = vix_m
+        df["YC_slope"]= yc_s
+
+        # MACD & signal
+        ema12 = prc_m.ewm(span=12).mean()
+        ema26 = prc_m.ewm(span=26).mean()
+        macd  = ema12 - ema26
+        df["MACD"]        = macd
+        df["MACD_Signal"] = macd.ewm(span=9).mean()
+
+        # ADX
+        up = highs[ticker].diff()
+        dn = lows[ticker].diff() * -1
+        plus = up.where((up>0)&(up>dn), 0.0)
+        minus= dn.where((dn>0)&(dn>up),0.0)
+        tr1 = highs[ticker] - lows[ticker]
+        tr2 = (highs[ticker] - prc_m.shift(1)).abs()
+        tr3 = (lows[ticker]  - prc_m.shift(1)).abs()
+        tr = pd.concat([tr1,tr2,tr3], axis=1).max(axis=1)
+        atr = tr.ewm(alpha=1/14).mean()
+        di_plus  = 100*(plus.ewm(alpha=1/14).mean()/atr)
+        di_minus = 100*(minus.ewm(alpha=1/14).mean()/atr)
+        df["ADX"] = ( (di_plus - di_minus).abs() / (di_plus + di_minus + 1e-9) *100 ).ewm(alpha=1/14).mean()
+
+        # sector momentum
+        sector = sector_map.get(ticker)
+        sec_rets = ret_m.groupby(pd.Series(sector_map)).mean()
+        sec1 = sec_rets[sector].rolling(1).mean().shift(1) if sector in sec_rets.columns else 0
+        sec3 = sec_rets[sector].rolling(3).mean().shift(1) if sector in sec_rets.columns else 0
+        df["SecMom1"] = sec1
+        df["SecMom3"] = sec3
+        df["SecRel"]  = df["M1"] - df["SecMom1"]
+
+        # fundamentals
+        f = get_fundamentals(ticker, fund_cache, st_status)
+        df["PE"], df["PB"], df["ROE"] = f["PE"], f["PB"], f["ROE"]
+
+        # target
+        df["Target"] = ret_m.shift(-1)
+
+        df.dropna(inplace=True)
+        return ticker, df
+
+    except Exception as e:
+        logging.warning(f"Feat eng failed for {ticker}: {e}")
+        return ticker, pd.DataFrame()
+
+
+def engineer_features(prices, highs, lows, monthly_vix, monthly_yc, sector_map, fund_cache, st_status=None):
+    """Parallel feature engineering across all tickers."""
+    tickers = [t for t in prices.columns if t not in ["SPY","^VIX"]]
+    results = Parallel(n_jobs=-1)(
+        delayed(engineer_features_single)(
+            t, prices, highs, lows, monthly_vix, monthly_yc,
+            sector_map, fund_cache, st_status
+        ) for t in tickers
+    )
+    feats = {t:df for t,df in results if not df.empty}
+    return feats
+
+
+# ─── 4. Portfolio Optimization ─────────────────────────────────────────────────
+def optimize_portfolio(expected, cov, sector_map, max_w=0.25):
+    """Maximize Sharpe with sector cap 30% and individual cap max_w."""
+    tickers = expected.index
+    S = cov * 12
+    def neg_sharpe(w):
+        r = np.dot(w, expected) * 12
+        vol = np.sqrt(w @ S @ w)
+        return -r/ (vol + 1e-9)
+
+    # constraints
+    cons = [{"type":"eq","fun":lambda w: w.sum()-1}]
+    # sector caps
+    sectors = {}
+    for i,t in enumerate(tickers):
+        sec = sector_map.get(t)
+        sectors.setdefault(sec,[]).append(i)
+    for idx in sectors.values():
+        cons.append({"type":"ineq","fun":lambda w,idx=idx:0.30 - w[idx].sum()})
+
+    bounds = [(0,max_w)]*len(tickers)
+    w0 = np.ones(len(tickers))/len(tickers)
+    res = minimize(neg_sharpe, w0, bounds=bounds, constraints=cons)
+    return pd.Series(res.x, index=tickers)
+
+
+# ─── 5. Walk‐Forward Validation ────────────────────────────────────────────────
+def run_walk_forward(features, start_date, st_status=None):
+    """Backtest by expanding window, returns DataFrame of monthly results."""
+    dates = sorted([d for d in next(iter(features.values())).index if d>=start_date])
+    allres=[]
+    for i,d in enumerate(dates):
+        if st_status: st_status.text(f"Backtest {d.strftime('%Y-%m')} ({i+1}/{len(dates)})")
+        train_end = d - relativedelta(months=1)
+        Xtr, ytr = [],[]
+        Xt, tickers, acts = [],[],[]
+        for t,df in features.items():
+            tr = df[df.index<=train_end]
+            if len(tr)>=24:
+                Xtr.append(tr.drop("Target",axis=1).values)
+                ytr.append(tr["Target"].values)
+            if d in df.index:
+                row = df.loc[d]
+                Xt.append(row.drop("Target").values)
+                acts.append(row["Target"])
+                tickers.append(t)
+        if not Xtr or not Xt: continue
+        Xtr = np.vstack(Xtr); ytr = np.hstack(ytr); Xt = np.vstack(Xt)
+        scaler = StandardScaler().fit(Xtr)
+        model  = XGBRegressor(n_estimators=100, max_depth=4, learning_rate=0.05, random_state=42)
+        p50    = model.fit(scaler.transform(Xtr), ytr).predict(scaler.transform(Xt))
+        month_df = pd.DataFrame({
+            "Date":d, "Ticker":tickers,
+            "P50":p50, "Actual":acts
+        })
+        allres.append(month_df)
+    return pd.concat(allres,ignore_index=True)
+
+
+# ─── 6. Performance Metrics ───────────────────────────────────────────────────
+def analyze_results(res_df, prices, sector_map):
+    """Turn monthly predictions into portfolio returns & metrics."""
+    port_rets=[]
+    hist = prices["SPY"].resample("M").last().pct_change()  # we'll compare to SPY
+    prev_w = None
+
+    for dt in res_df.Date.unique():
+        sub = res_df[res_df.Date==dt].set_index("Ticker")
+        subs = sub[sub.P50>0].nlargest(10,"P50")
+        if len(subs)>1:
+            er = subs.P50
+            cov = prices[tickers].resample("M").last().pct_change().loc[:dt - relativedelta(months=1)][subs.index].cov()
+            w = optimize_portfolio(er, cov, sector_map)
+            port_rets.append((w*subs.Actual).sum())
+            prev_w = w
+        else:
+            port_rets.append(0.0)
+
+    portfolio = pd.Series(port_rets,index=sorted(res_df.Date.unique()))
+    df = pd.DataFrame({
+        "Model": portfolio,
+        "SPY": hist.reindex(portfolio.index)
+    })
+    df["Cumulative"] = (1+df.Model).cumprod()
+    rf = 0.0
+
+    sharpe = (df.Model.mean()*12 - rf)/(df.Model.std()*np.sqrt(12))
+    maxdd  = (1 - df.Cumulative/df.Cumulative.cummax()).max()
+    annret = df.Model.mean()*12
+
+    metrics = {"Sharpe":sharpe, "MaxDrawdown":maxdd, "AnnualReturn":annret}
+    return df, metrics
+
+
+# ─── 7. Public API ─────────────────────────────────────────────────────────────
 def get_available_sectors():
     _, sm = fetch_sp500_constituents()
     return sorted(set(sm.values()))
 
-# ─── MARKET + MACRO DATA ──────────────────────────────────────────────────────
-@memory.cache
-def fetch_market_data(tickers, start, end):
-    # one call for OHLC
-    raw = yf.download(tickers + ["SPY", "^VIX"], start=start, end=end,
-                      auto_adjust=True, timeout=30)
-    closes = raw["Close"]
-    highs  = raw["High"]
-    lows   = raw["Low"]
-    # FRED via fredapi
-    macro = pd.DataFrame()
-    try:
-        fred = Fred(api_key=os.getenv("FRED_API_KEY"))
-        cpi = fred.get_series("CPIAUCSL", start, end)
-        ism = fred.get_series("ISM", start, end)
-        yc2 = fred.get_series("DGS2", start, end)
-        yc10= fred.get_series("DGS10", start, end)
-        macro = pd.DataFrame({
-            "CPI_YoY": cpi.pct_change(12) * 100,
-            "ISM": ism,
-            "YC_slope": (yc10 - yc2)
-        })
-    except Exception as e:
-        logging.warning(f"fredapi error, skipping macro: {e}")
-    return closes, highs, lows, macro
-
-# ─── FUNDAMENTALS CACHING ─────────────────────────────────────────────────────
-def fetch_fundamentals_batch(tickers, cache, st_status=None):
-    for t in tickers:
-        if t in cache: continue
-        try:
-            if st_status: st_status.text(f"Loading fundamentals for {t}…")
-            info = yf.Ticker(t).info
-            cache[t] = {
-                "PE": info.get("trailingPE", np.nan),
-                "PB": info.get("priceToBook", np.nan),
-                "ROE": info.get("returnOnEquity", np.nan)
-            }
-        except Exception as e:
-            logging.warning(f"fund fetch failed {t}: {e}")
-            cache[t] = {"PE": np.nan, "PB": np.nan, "ROE": np.nan}
-    return cache
-
-# ─── FEATURE ENGINEERING ─────────────────────────────────────────────────────
-def engineer_features(closes, highs, lows, macro, sector_map, fund_cache, st_status=None):
-    # monthly closes & returns
-    mclose = closes.resample("M").last()
-    mret   = mclose.pct_change().dropna(how="all")
-    spyret = mret["SPY"]
-    vix    = mclose["^VIX"].shift(1)
-
-    # MACD & signal
-    ema12 = mclose.ewm(span=12).mean()
-    ema26 = mclose.ewm(span=26).mean()
-    macd  = ema12 - ema26
-    sig   = macd.ewm(span=9).mean()
-
-    # ADX
-    ph = highs.resample("M").max()
-    pl = lows.resample("M").min()
-    tr = pd.concat([
-        ph - pl,
-        (ph - mclose.shift(1)).abs(),
-        (pl - mclose.shift(1)).abs()
-    ], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1/14).mean()
-    plus  = ph.diff().clip(lower=0).ewm(alpha=1/14).mean()
-    minus = (-pl.diff().clip(upper=0)).ewm(alpha=1/14).mean()
-    adx   = ((plus - minus).abs()/(plus + minus + 1e-9)*100).ewm(alpha=1/14).mean()
-
-    # Sector momentum
-    sec_srs = mret.groupby(pd.Series(sector_map), axis=1).mean()
-    sec1    = sec_srs.rolling(1).mean()
-
-    feats = {}
-    for t in [c for c in mclose.columns if c not in ["SPY","^VIX"]]:
-        if st_status: st_status.text(f"Feature-engineering {t}")
-        df = pd.DataFrame(index=mret.index)
-        df["M1"]    = mret[t].shift(1)
-        df["Vol3"]  = mret[t].rolling(3).std().shift(1)
-        df["Beta"]  = mret[t].rolling(12).cov(spyret).shift(1) / spyret.rolling(12).var()
-        df["VIX"]   = vix
-        df["MACD"]  = macd[t]
-        df["Signal"]= sig[t]
-        df["ADX"]   = adx[t]
-        df["SecMom"]= sec1.get(t, 0.0)
-        df["SecRel"]= df["M1"] - df["SecMom"]
-
-        # fundamentals
-        f = fund_cache.get(t, {})
-        df["PE"], df["PB"], df["ROE"] = f.get("PE", np.nan), f.get("PB", np.nan), f.get("ROE", np.nan)
-
-        # macro & yield-curve slope
-        if not macro.empty:
-            md = macro.resample("M").last().shift(1)
-            df = df.join(md, how="left").ffill().fillna(0)
-        else:
-            df["CPI_YoY"], df["ISM"], df["YC_slope"] = 0,0,0
-
-        df["Target"] = mret[t].shift(-1)
-        df.dropna(inplace=True)
-        if not df.empty:
-            feats[t] = df
-        logging.debug(f"{t}: {df.shape[0]} rows")
-    logging.info(f"Built features for {len(feats)} tickers")
-    return feats
-
-# ─── PORTFOLIO OPTIMIZER ──────────────────────────────────────────────────────
-def optimize_weights(dfm, hist_ret, sector_map, maxw=0.25):
-    tickers = dfm.index.tolist()
-    p50     = dfm["P50"]
-    cov     = hist_ret.cov()*12
-
-    def negsh(w):
-        r = w.dot(p50)*12
-        v = np.sqrt(w.dot(cov).dot(w))
-        return -r/(v+1e-9)
-
-    # constraints: sum=1 + each sector ≤30%
-    cons = [{"type":"eq","fun":lambda w:w.sum()-1}]
-    bysec = {}
-    for i,t in enumerate(tickers):
-        sec = sector_map.get(t)
-        bysec.setdefault(sec, []).append(i)
-    for idx in bysec.values():
-        cons.append({"type":"ineq","fun":lambda w,i=idx:0.30 - w[i].sum()})
-    bounds = [(0,maxw)]*len(tickers)
-    res = minimize(negsh, np.ones(len(tickers))/len(tickers),
-                   bounds=bounds, constraints=cons)
-    return pd.Series(res.x, index=tickers)
-
-# ─── WALK-FORWARD BACKTEST ────────────────────────────────────────────────────
 def run_backtest_pipeline(st_status=None, start_date="2016-01-01"):
-    START, END = "2013-01-01", datetime.today().strftime("%Y-%m-%d")
-    val_start  = pd.to_datetime(start_date)
-
+    """Entry point for Strategy Backtest tab."""
+    sd = pd.to_datetime(start_date)
     tickers, sector_map = fetch_sp500_constituents()
-    closes, highs, lows, macro = fetch_market_data(tickers, START, END)
+    prices, highs, lows, mvix, myc = fetch_market_data("2013-01-01", datetime.today().strftime("%Y-%m-%d"))
     fund_cache = load_fund_cache()
-    fund_cache = fetch_fundamentals_batch(tickers, fund_cache, st_status)
+    batch_fundamentals(tickers, fund_cache, st_status)
     save_fund_cache(fund_cache)
 
-    feats = engineer_features(closes, highs, lows, macro, sector_map, fund_cache, st_status)
-    if st_status:
-        st_status.text(f"{len(feats)} tickers after feature-engineering")
+    feats = engineer_features(prices, highs, lows, mvix, myc, sector_map, fund_cache, st_status)
     if not feats:
-        raise RuntimeError("No features generated—check backend.log")
+        raise RuntimeError("Feature engineering produced NO series—check backend.log")
 
-    results = []
-    dates = sorted([d for d in feats[next(iter(feats))].index if d >= val_start])
-    for dt in dates:
-        Xtr, Ytr, Xte, actuals, names = [], [], [], [], []
-        for t, df in feats.items():
-            train = df[df.index < dt]
-            if len(train) >= 24:
-                Xtr.append(train.drop("Target",axis=1).values)
-                Ytr.append(train["Target"].values)
-            if dt in df.index:
-                row = df.loc[dt]
-                Xte.append(row.drop("Target").values)
-                actuals.append(row["Target"])
-                names.append(t)
-        if not Xte: continue
+    res = run_walk_forward(feats, sd, st_status)
+    df, mets = analyze_results(res, prices, sector_map)
+    return df, mets
 
-        Xtr, Ytr, Xte = np.vstack(Xtr), np.hstack(Ytr), np.vstack(Xte)
-        model = XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=5, random_state=42)
-        scaler = StandardScaler().fit(Xtr)
-        P50    = model.fit(scaler.transform(Xtr), Ytr).predict(scaler.transform(Xte))
-
-        dfm = pd.DataFrame({"Ticker":names,"P50":P50,"Actual":actuals}).set_index("Ticker")
-        hist = closes.resample("M").last().pct_change().loc[:dt].tail(12)[names]
-        w    = optimize_weights(dfm, hist, sector_map)
-        ret  = w.dot(dfm["Actual"])
-        results.append({"Date":dt,"Return":ret})
-
-    out = pd.DataFrame(results).set_index("Date")
-    out["Cumulative"] = (1+out["Return"]).cumprod()
-    ann  = out["Return"].mean()*12
-    vol  = out["Return"].std()*np.sqrt(12)
-    shar = ann/vol
-    mdd  = (1 - out["Cumulative"]/out["Cumulative"].cummax()).max()
-    return out, {"Sharpe":shar,"MaxDrawdown":mdd,"AnnualReturn":ann}
-
-# ─── LIVE PREDICTION ───────────────────────────────────────────────────────────
 def run_live_prediction_pipeline(st_status=None, selected_sectors=None, max_stock_weight=0.25):
-    START, END = "2013-01-01", datetime.today().strftime("%Y-%m-%d")
+    """Entry point for Live Portfolio tab."""
     tickers, sector_map = fetch_sp500_constituents()
     if selected_sectors:
         tickers = [t for t in tickers if sector_map.get(t) in selected_sectors]
-        sector_map = {t:sector_map[t] for t in tickers}
-
-    closes, highs, lows, macro = fetch_market_data(tickers, START, END)
+        sector_map = {t: sector_map[t] for t in tickers}
+    prices, highs, lows, mvix, myc = fetch_market_data("2013-01-01", datetime.today().strftime("%Y-%m-%d"))
     fund_cache = load_fund_cache()
-    fund_cache = fetch_fundamentals_batch(tickers, fund_cache, st_status)
+    batch_fundamentals(tickers, fund_cache, st_status)
     save_fund_cache(fund_cache)
 
-    feats = engineer_features(closes, highs, lows, macro, sector_map, fund_cache, st_status)
-    if not feats:
-        return pd.DataFrame()
-
-    Xtr, Ytr, Xp, names = [], [], [], []
-    for t, df in feats.items():
-        Xtr.append(df.drop("Target",axis=1).values)
-        Ytr.append(df["Target"].values)
+    feats = engineer_features(prices, highs, lows, mvix, myc, sector_map, fund_cache, st_status)
+    # build final prediction matrix
+    Xp, tickers_p = [], []
+    for t,df in feats.items():
         Xp.append(df.drop("Target",axis=1).iloc[-1].values)
-        names.append(t)
-    Xtr, Ytr, Xp = np.vstack(Xtr), np.hstack(Ytr), np.vstack(Xp)
+        tickers_p.append(t)
+    if not Xp:
+        return pd.DataFrame()
+    Xp = np.vstack(Xp)
+    # train on all history
+    full = pd.concat(feats.values())
+    scaler = StandardScaler().fit(full.drop("Target",axis=1).values)
+    model  = XGBRegressor(n_estimators=100, max_depth=4, learning_rate=0.05, random_state=42)
+    model.fit(scaler.transform(full.drop("Target",axis=1).values), full.Target.values)
+    p50 = model.predict(scaler.transform(Xp))
 
-    model  = XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=5, random_state=42)
-    scaler = StandardScaler().fit(Xtr)
-    P50    = model.fit(scaler.transform(Xtr), Ytr).predict(scaler.transform(Xp))
-
-    dfm = pd.DataFrame({"Ticker":names,"P50":P50}).set_index("Ticker")
-    cutoff = np.percentile(P50, 90)
-    wdf    = dfm[dfm["P50"]>cutoff].nlargest(15,"P50")
-    hist   = closes.resample("M").last().pct_change().tail(13).iloc[:-1]
-    cov    = hist[wdf.index].cov()*12
-
-    def negsh2(w): return -(w.dot(wdf["P50"])*12)/np.sqrt(w.dot(cov).dot(w)+1e-9)
-    cons = [{"type":"eq","fun":lambda w:w.sum()-1}]
-    bnds = [(0,max_stock_weight)]*len(wdf)
-    res  = minimize(negsh2, np.ones(len(wdf))/len(wdf), bounds=bnds, constraints=cons)
-    return pd.Series(res.x,index=wdf.index).to_frame("Weight")
+    preds = pd.Series(p50, index=tickers_p, name="P50").nlargest(15)
+    cov   = prices[tickers_p].resample("M").last().pct_change().iloc[-12:].cov()
+    w     = optimize_portfolio(preds, cov, sector_map, max_stock_weight)
+    return pd.DataFrame({"Weight":w})
