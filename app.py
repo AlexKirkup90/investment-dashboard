@@ -1,9 +1,8 @@
 # ==============================================================================
 # V14 - DEFINITIVE APP (REPAIRED)
 # ==============================================================================
-# This version fixes all critical faults. It correctly calls the backend,
-# removes all calculation logic from the UI, and properly displays the
-# results returned by the backend engine.
+# This version is simplified to correctly call the memory-efficient backend
+# and display the results without performing complex calculations itself.
 # ==============================================================================
 
 import streamlit as st
@@ -28,8 +27,6 @@ tabs = st.tabs(["Live Portfolio", "Strategy Backtest"])
 # --- Live Portfolio Tab ---
 with tabs[0]:
     st.header("Live Portfolio Allocation")
-    
-    # FIXED: Correctly call the backend to get sectors
     try:
         available_sectors = backend.get_available_sectors()
         selected_sectors = st.multiselect("Select Sectors (leave empty for all)", available_sectors, default=[])
@@ -38,7 +35,6 @@ with tabs[0]:
         if st.button("Generate Live Portfolio"):
             with st.spinner("Computing live portfolio..."):
                 try:
-                    # FIXED: Correctly pass arguments to the backend
                     portfolio = backend.run_live_prediction_pipeline(
                         st_status=st,
                         selected_sectors=selected_sectors,
@@ -52,10 +48,8 @@ with tabs[0]:
                 except Exception as e:
                     tb = traceback.format_exc()
                     st.error(f"⚠️ Live portfolio generation failed:\n```\n{e}\n{tb}\n```")
-
     except Exception as e:
         st.error(f"Could not load sectors. Please ensure your FRED API key is set in secrets.toml. Error: {e}")
-
 
 # --- Strategy Backtest Tab ---
 with tabs[1]:
@@ -68,7 +62,6 @@ with tabs[1]:
     if st.button("Run Full Backtest"):
         with st.spinner("Running walk-forward backtest..."):
             try:
-                # FIXED: Correctly call backend and unpack results
                 df, metrics = backend.run_backtest_pipeline(
                     st_status=st,
                     start_date=start_date.strftime("%Y-%m-%d"),
@@ -87,16 +80,13 @@ with tabs[1]:
         metrics = st.session_state.backtest_metrics
         
         st.subheader("Performance Metrics")
-        # FIXED: Display metrics directly from the backend result
         col1, col2, col3 = st.columns(3)
         col1.metric("Annualized Sharpe", f"{metrics.get('Sharpe', 0):.2f}")
         col2.metric("Max Drawdown", f"{metrics.get('MaxDrawdown', 0):.2%}")
         col3.metric("Annual Return", f"{metrics.get('AnnualReturn', 0):.2%}")
 
         st.subheader("Cumulative Returns")
-        # FIXED: Display the pre-calculated 'Cumulative' column from the backend
         st.line_chart(df[['Cumulative', 'SPY_Cumulative']])
 
         st.subheader("Drawdown")
-        # FIXED: Display the pre-calculated 'Drawdown' column from the backend
         st.line_chart(df['Drawdown'])
