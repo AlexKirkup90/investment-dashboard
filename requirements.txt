@@ -1,14 +1,26 @@
-pandas>=2.3.1
-numpy>=2.3.1
+# Core data & science
+pandas>=2.0
+numpy>=1.25
+
+# Market data
+yfinance>=0.2.65
+
+# HTTP
+requests>=2.32.4
+
+# Caching / parallelism
+joblib>=1.5.1
+
+# Machine learning
 scikit-learn>=1.7.0
 xgboost>=3.0.2
+
+# Optimization
 scipy>=1.16.0
-joblib>=1.5.1
-yfinance>=0.2.65
-fredapi>=0.7.0
-requests>=2.32.4
+
+# Dashboard
 streamlit>=1.46.1
 matplotlib>=3.10.3
-python-dateutil>=2.9.0
-pytz>=2025.2
-setuptools>=65.0.0
+
+# FRED access (compatible up through 0.5.2 on Python 3.12)
+fredapi>=0.5.2
