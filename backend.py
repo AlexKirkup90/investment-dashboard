@@ -1,5 +1,5 @@
 # ==============================================================================
-# V13 - DEFINITIVE ENGINE (BACKEND) - REPAIRED
+# V14 - DEFINITIVE ENGINE (BACKEND) - REPAIRED
 # ==============================================================================
 # This version fixes all critical faults, correctly implements the live
 # portfolio mode with user-defined parameters, and returns a clean, unified
@@ -68,7 +68,11 @@ def fetch_market_data(tickers, start, end):
     raw_data = yf.download(all_tickers, start=start, end=end, auto_adjust=True, timeout=30)
     prices, highs, lows = raw_data['Close'], raw_data['High'], raw_data['Low']
     try:
-        fred = Fred(api_key=st.secrets.get("FRED", {}).get("API_KEY"))
+        # FIXED: Initialize FRED client safely using Streamlit secrets
+        fred_api_key = st.secrets.get("FRED", {}).get("API_KEY")
+        if not fred_api_key:
+            raise ValueError("FRED API key not found in secrets.toml")
+        fred = Fred(api_key=fred_api_key)
         rates2 = fred.get_series("DGS2", start, end)
         rates10 = fred.get_series("DGS10", start, end)
         yc_slope = (rates10 - rates2).dropna()
@@ -166,8 +170,13 @@ def calculate_performance_metrics(results_df, prices, sector_map, risk_free_rate
     # FIXED: Renamed column to 'Return' to match app.py expectation
     portfolio_df = pd.DataFrame({'Date': pd.to_datetime(results_df['PredictionDate'].unique()), 'Return': portfolio_monthly_returns}).set_index('Date')
     
+    spy_monthly_returns = prices['SPY'].resample('M').last().pct_change()
+    portfolio_df['SPY_Return'] = spy_monthly_returns.reindex(portfolio_df.index)
+    portfolio_df.dropna(inplace=True)
+    
     # FIXED: All calculations are now done in the backend
     portfolio_df['Cumulative'] = (1 + portfolio_df['Return']).cumprod()
+    portfolio_df['SPY_Cumulative'] = (1 + portfolio_df['SPY_Return']).cumprod()
     portfolio_df['Drawdown'] = 1 - portfolio_df['Cumulative'] / portfolio_df['Cumulative'].cummax()
     
     metrics = {}
@@ -223,6 +232,7 @@ def run_live_prediction_pipeline(st_status, selected_sectors, max_stock_weight):
     END_DATE = datetime.today().strftime('%Y-%m-%d')
     tickers, sector_map = fetch_sp500_constituents()
 
+    # Filter tickers based on user selection
     if selected_sectors:
         tickers = [t for t in tickers if sector_map.get(t) in selected_sectors]
 
