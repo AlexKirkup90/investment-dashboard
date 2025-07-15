@@ -28,7 +28,7 @@ warnings.filterwarnings('ignore')
 CACHE_DIR = "model_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 memory = joblib.Memory(CACHE_DIR, verbose=0)
-FUNDAMENTALS_CACHE_FILE = os.path.join(CACHE_DIR, 'fundamentals_cache.json')
+FUNDAMENTALS_CACHE_FILE = os.path.join(CACHE_DIR, 'fundamentals.json')
 
 # --- Caching Functions ---
 def load_fundamentals_cache():
@@ -71,7 +71,7 @@ def fetch_market_data(tickers, start, end):
         # FIXED: Initialize FRED client safely using Streamlit secrets
         fred_api_key = st.secrets.get("FRED", {}).get("API_KEY")
         if not fred_api_key:
-            raise ValueError("FRED API key not found in secrets.toml")
+            raise ValueError("FRED API key not found in secrets.toml. Please add it.")
         fred = Fred(api_key=fred_api_key)
         rates2 = fred.get_series("DGS2", start, end)
         rates10 = fred.get_series("DGS10", start, end)
