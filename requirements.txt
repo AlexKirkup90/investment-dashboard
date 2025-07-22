@@ -1,30 +1,30 @@
 Core data & science
-pandas>=2.0
-numpy>=1.25
-lxml>=4.9.0
+pandas==2.2.2
+numpy==1.26.4
+lxml==5.2.2
 
 Market data
-yfinance>=0.2.65
+yfinance==0.2.40
 
 HTTP
-requests>=2.32.4
+requests==2.32.3
 
 Caching / parallelism
-joblib>=1.5.1
+joblib==1.4.2
 
 Machine learning
-scikit-learn>=1.7.0
-xgboost>=3.0.2
+scikit-learn==1.5.0
+xgboost==2.1.0
 
 Optimization
-scipy>=1.16.0
+scipy==1.14.0
 
 Dashboard
-streamlit>=1.46.1
-matplotlib>=3.10.3
+streamlit==1.38.0
+matplotlib==3.9.1
 
 FRED access (kept for potential future use, but not required by current model)
-fredapi>=0.5.2
+fredapi==0.5.2
 
 Technical Analysis library (for RSI, ADX, etc.)
-ta>=0.10.2
+ta==0.11.0
