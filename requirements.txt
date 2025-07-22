@@ -1,27 +1,30 @@
-# Core data & science
+Core data & science
 pandas>=2.0
 numpy>=1.25
 lxml>=4.9.0
 
-# Market data
+Market data
 yfinance>=0.2.65
 
-# HTTP
+HTTP
 requests>=2.32.4
 
-# Caching / parallelism
+Caching / parallelism
 joblib>=1.5.1
 
-# Machine learning
+Machine learning
 scikit-learn>=1.7.0
 xgboost>=3.0.2
 
-# Optimization
+Optimization
 scipy>=1.16.0
 
-# Dashboard
+Dashboard
 streamlit>=1.46.1
 matplotlib>=3.10.3
 
-# FRED access
+FRED access (kept for potential future use, but not required by current model)
 fredapi>=0.5.2
+
+Technical Analysis library (for RSI, ADX, etc.)
+ta>=0.10.2
