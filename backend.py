@@ -1,9 +1,9 @@
 # ==============================================================================
-# V40.1 - ULTIMATE MODEL LIVE ENGINE (PRODUCTION FIX)
+# V40.2 - ULTIMATE MODEL LIVE ENGINE (BULLETPROOF DATA FETCHING)
 # ==============================================================================
-# This version includes the most robust data fetching logic possible to handle
-# network restrictions and API rate-limiting on Streamlit Cloud. It is slower
-# but designed for maximum reliability in a production environment.
+# This version includes the definitive, most robust data fetching logic to handle
+# network restrictions on Streamlit Cloud. It uses chunking with a single-ticker
+# fallback to ensure maximum reliability.
 # ==============================================================================
 
 import pandas as pd
@@ -80,37 +80,44 @@ def fetch_sp500_constituents():
 def fetch_market_data(tickers, start, end, st_status=None):
     all_tickers = tickers + ['SPY', '^VIX']
     all_data = []
-    chunk_size = 50  # Smaller chunk size for more reliability
-    max_retries = 3
-    retry_delay = 5 # seconds
+    chunk_size = 100
     
     if st_status: st_status.text(f"Downloading market data for {len(all_tickers)} tickers...")
-    
     for i in range(0, len(all_tickers), chunk_size):
         chunk = all_tickers[i:i + chunk_size]
         if st_status: st_status.text(f"  Downloading chunk {i//chunk_size + 1}/{(len(all_tickers)//chunk_size) + 1}...")
-        
-        for attempt in range(max_retries):
-            try:
-                data = yf.download(chunk, start=start, end=end, auto_adjust=True, timeout=30, threads=False)
-                
-                # Check if the download was successful and data is structured correctly
-                if data.empty or not isinstance(data.columns, pd.MultiIndex):
-                    raise ValueError(f"Incomplete or malformed data for chunk {i//chunk_size + 1}.")
-                
+        try:
+            data = yf.download(chunk, start=start, end=end, auto_adjust=True, timeout=30, threads=False)
+            
+            # Check for failed downloads within the chunk
+            downloaded_tickers = data.columns.get_level_values(1).unique().tolist()
+            failed_tickers = [t for t in chunk if t not in downloaded_tickers]
+            
+            if data.empty and chunk:
+                 raise ValueError("Chunk download returned no data.")
+            
+            # Add successfully downloaded data
+            if not data.empty:
                 all_data.append(data)
-                if st_status: st_status.text(f"  Chunk {i//chunk_size + 1} downloaded successfully.")
-                break # Exit retry loop on success
-            except Exception as e:
-                print(f"    -> Attempt {attempt + 1} failed for chunk {i//chunk_size + 1}: {e}")
-                if attempt < max_retries - 1:
-                    if st_status: st_status.text(f"  Retrying chunk {i//chunk_size + 1} in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-                else:
-                    if st_status: st_status.text(f"  ❌ FAILED to download chunk {i//chunk_size + 1}. Skipping.")
-                    print(f"  -> ❌ FAILED to download chunk {i//chunk_size + 1} after {max_retries} attempts.")
+            
+            # Fallback for any tickers that failed in the chunk
+            if failed_tickers:
+                if st_status: st_status.text(f"    -> {len(failed_tickers)} tickers failed. Retrying individually...")
+                for ticker in failed_tickers:
+                    try:
+                        single_data = yf.download(ticker, start=start, end=end, auto_adjust=True, timeout=30)
+                        if not single_data.empty:
+                            # Reformat single ticker data to match multi-ticker format
+                            single_data.columns = pd.MultiIndex.from_product([single_data.columns, [ticker]])
+                            all_data.append(single_data)
+                        time.sleep(0.1)
+                    except Exception as single_e:
+                        print(f"      -> ❌ FAILED to download single ticker {ticker}. Error: {single_e}")
+
+        except Exception as e:
+            print(f"    -> Chunk download failed: {e}. All tickers in chunk will be skipped.")
         
-        time.sleep(2) # Longer pause between chunks
+        time.sleep(1) # Pause between chunks
 
     if not all_data: 
         raise ConnectionError("Failed to download any market data after all retries.")
