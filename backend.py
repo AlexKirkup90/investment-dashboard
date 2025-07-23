@@ -20,8 +20,13 @@ from dateutil.relativedelta import relativedelta
 from sklearn.preprocessing import StandardScaler, PolynomialFeatures
 from xgboost import XGBRegressor
 import warnings
+from requests import Session
 
 warnings.filterwarnings('ignore')
+
+# --- Setup Requests Session for Reliability ---
+session = Session()
+session.headers['User-agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'
 
 # --- Setup Caching ---
 CACHE_DIR = "model_cache"
@@ -44,7 +49,7 @@ def get_fundamentals(ticker, cache, st_status=None):
     if ticker in cache: return cache[ticker]
     try:
         if st_status: st_status.text(f"Fetching fundamentals for {ticker}...")
-        info = yf.Ticker(ticker).info
+        info = yf.Ticker(ticker, session=session).info
         fcf = info.get('freeCashflow', 0)
         mkt_cap = info.get('marketCap', 0)
         fcf_yield = fcf / mkt_cap if mkt_cap and fcf is not None else np.nan
@@ -80,16 +85,19 @@ def fetch_sp500_constituents():
 def fetch_market_data(tickers, start, end, st_status=None):
     all_tickers = tickers + ['SPY', '^VIX']
     all_data = []
-    chunk_size = 100
+    chunk_size = 20  # Reduced for reliability in Streamlit Cloud
     
     if st_status: st_status.text(f"Downloading market data for {len(all_tickers)} tickers...")
     for i in range(0, len(all_tickers), chunk_size):
         chunk = all_tickers[i:i + chunk_size]
         if st_status: st_status.text(f"  Downloading chunk {i//chunk_size + 1}/{(len(all_tickers)//chunk_size) + 1}...")
         try:
-            data = yf.download(chunk, start=start, end=end, auto_adjust=True, timeout=30, threads=False)
+            data = yf.download(chunk, start=start, end=end, auto_adjust=True, timeout=30, threads=False, session=session)
             
             # Check for failed downloads within the chunk
+            downloaded_tickers = data.columns.get_level_values(1).unique().tolist()
+            failed_tickers = [t for t in chunk if t not in downloaded_tickers]
+            
             downloaded_tickers = data.columns.get_level_values(1).unique().tolist()
             failed_tickers = [t for t in chunk if t not in downloaded_tickers]
             
@@ -105,19 +113,18 @@ def fetch_market_data(tickers, start, end, st_status=None):
                 if st_status: st_status.text(f"    -> {len(failed_tickers)} tickers failed. Retrying individually...")
                 for ticker in failed_tickers:
                     try:
-                        single_data = yf.download(ticker, start=start, end=end, auto_adjust=True, timeout=30)
+                        single_data = yf.download(ticker, start=start, end=end, auto_adjust=True, timeout=30, session=session)
                         if not single_data.empty:
-                            # Reformat single ticker data to match multi-ticker format
                             single_data.columns = pd.MultiIndex.from_product([single_data.columns, [ticker]])
                             all_data.append(single_data)
-                        time.sleep(0.1)
+                        time.sleep(1)  # Increased sleep for single downloads
                     except Exception as single_e:
                         print(f"      -> ❌ FAILED to download single ticker {ticker}. Error: {single_e}")
 
         except Exception as e:
             print(f"    -> Chunk download failed: {e}. All tickers in chunk will be skipped.")
         
-        time.sleep(1) # Pause between chunks
+        time.sleep(5) # Increased pause between chunks
 
     if not all_data: 
         raise ConnectionError("Failed to download any market data after all retries.")
@@ -209,11 +216,19 @@ def engineer_features_low_risk(prices, highs, monthly_prices, monthly_returns, m
             feature_names_new = feature_names[len(poly_cols):]
             poly_df = pd.DataFrame(poly_feats_new, index=df.index, columns=feature_names_new)
             df = pd.concat([df, poly_df], axis=1)
-            df['Target'] = ret.shift(-1) / (df['Vol3'] + 1e-9) # Optimize for Sharpe
+            df['Target'] = ret.shift(-1) / (df['Vol3'] + 1e-9)
             df.replace([np.inf, -np.inf], np.nan, inplace=True)
             df.dropna(inplace=True)
-            if not df.empty: features_dict[ticker] = df
-        except Exception: continue
+            if not df.empty:
+                features_dict[ticker] = df
+            else:
+                skipped += 1
+                logger.info(f"Skipped {ticker}: insufficient data after processing")
+        except Exception as e:
+            skipped += 1
+            logger.error(f"Error engineering features for {ticker}: {e}")
+            continue
+    logger.info(f"Low-risk features engineered; {skipped} tickers skipped.")
     return features_dict
 
 # --- Live Prediction Pipeline ---
