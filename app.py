@@ -1,9 +1,8 @@
+# app.py
 import streamlit as st
-import pandas as pd
 import backend  # your updated backend with AlphaVantage fallback
 import traceback
 
-# --- Page Configuration ---
 st.set_page_config(
     layout="wide",
     page_title="Ultimate Model Portfolio Generator (V40)"
