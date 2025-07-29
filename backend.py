@@ -1,3 +1,4 @@
+# backend.py
 # ==============================================================================
 # V40.2 - ULTIMATE MODEL LIVE ENGINE (BULLETPROOF DATA FETCHING)
 # ==============================================================================
@@ -93,18 +94,16 @@ def fetch_sp500_constituents():
 @memory.cache
 def fetch_market_data(tickers, start, end, st_status=None):
     all_tickers = tickers + ['SPY', '^VIX']
-    all_data = []
     chunk_size = 20
+    all_data = []
 
-    if st_status:
-        st_status.text(f"Downloading market data for {len(all_tickers)} tickers (YFinance)…")
     # 1) Try YFinance in chunks
+    if st_status:
+        st_status.text(f"Downloading {len(all_tickers)} tickers via YFinance…")
     for i in range(0, len(all_tickers), chunk_size):
         chunk = all_tickers[i : i + chunk_size]
         if st_status:
-            st_status.text(
-                f"  YF chunk {i//chunk_size+1}/{(len(all_tickers)-1)//chunk_size+1}…"
-            )
+            st_status.text(f"YF chunk {i//chunk_size+1}/{(len(all_tickers)-1)//chunk_size+1}…")
         try:
             df = yf.download(
                 chunk, start=start, end=end,
@@ -117,17 +116,18 @@ def fetch_market_data(tickers, start, end, st_status=None):
             print(f"YF chunk error: {e}")
         time.sleep(5)
 
-    # If nothing from YF, fall back to AlphaVantage
+    # 2) Fallback if needed
     if not all_data:
         api_key = st.secrets.get("ALPHAVANTAGE_API_KEY") or os.getenv("ALPHAVANTAGE_API_KEY")
         if not api_key:
             raise ConnectionError(
-                "YFinance failed and no ALPHAVANTAGE_API_KEY in secrets/env."
+                "YFinance failed and no ALPHAVANTAGE_API_KEY found in secrets or env."
             )
         if st_status:
-            st_status.text("YFinance failed — falling back to AlphaVantage…")
+            st_status.text("YFinance failed — falling back to AlphaVantage for equities and SPY…")
         av_frames = []
-        for ticker in all_tickers:
+        av_tickers = tickers + ['SPY']
+        for ticker in av_tickers:
             try:
                 resp = session.get(
                     "https://www.alphavantage.co/query",
@@ -138,9 +138,8 @@ def fetch_market_data(tickers, start, end, st_status=None):
                         "apikey": api_key
                     },
                     timeout=30
-                )
-                data = resp.json().get("Time Series (Daily)", {})
-                df = pd.DataFrame.from_dict(data, orient='index')
+                ).json().get("Time Series (Daily)", {})
+                df = pd.DataFrame.from_dict(resp, orient='index')
                 df.index = pd.to_datetime(df.index)
                 df = df.sort_index().loc[start:end]
                 df = df.rename(columns={
@@ -155,12 +154,25 @@ def fetch_market_data(tickers, start, end, st_status=None):
                 print(f"AlphaVantage failed for {ticker}: {e}")
         if not av_frames:
             raise ConnectionError(
-                "Failed to fetch data from both YFinance and AlphaVantage."
+                "Failed to fetch any equity data from both YFinance and AlphaVantage."
             )
         raw = pd.concat(av_frames, axis=1)
+        # 3) Always fetch VIX via yfinance
+        try:
+            vix_df = yf.download(
+                '^VIX', start=start, end=end,
+                auto_adjust=True, timeout=30,
+                session=session
+            )
+            if not vix_df.empty:
+                vix_df.columns = pd.MultiIndex.from_product([vix_df.columns, ['^VIX']])
+                raw = pd.concat([raw, vix_df], axis=1)
+        except Exception:
+            print("Warning: failed to fetch ^VIX via yfinance in fallback.")
     else:
         raw = pd.concat(all_data, axis=1)
 
+    # Final cleanup
     raw = raw.loc[:, ~raw.columns.duplicated()]
     prices = raw['Close'].dropna(axis=1, how='all')
     highs  = raw['High'].dropna(axis=1, how='all')
@@ -168,11 +180,9 @@ def fetch_market_data(tickers, start, end, st_status=None):
     return prices, highs, lows
 
 # --- Feature Engineering Functions ---
-def engineer_features_high_return(
-    prices, monthly_prices, monthly_returns,
-    monthly_spy_returns, sector_mom_1m,
-    sector_map, fundamentals_cache, st_status=None
-):
+def engineer_features_high_return(prices, monthly_prices, monthly_returns,
+                                  monthly_spy_returns, sector_mom_1m,
+                                  sector_map, fundamentals_cache, st_status=None):
     features = {}
     tickers = [t for t in prices.columns if t not in ['SPY','^VIX']]
     poly = PolynomialFeatures(degree=2, include_bias=False)
@@ -188,14 +198,14 @@ def engineer_features_high_return(
             df['CompositeMom'] = 0.5*df['M6'] + 0.5*df['M12']
             df['Vol3'] = ret.rolling(3).std().shift(1)
             df['VIX'] = monthly_prices['^VIX'].shift(1)
-            df['Beta'] = ret.rolling(12).cov(monthly_spy_returns).shift(1) / \
-                         monthly_spy_returns.rolling(12).var().shift(1)
+            df['Beta'] = (ret.rolling(12).cov(monthly_spy_returns).shift(1) /
+                          monthly_spy_returns.rolling(12).var().shift(1))
             sector = sector_map.get(ticker)
-            df['SectorMom_1M'] = sector_mom_1m[sector].shift(1) \
-                                 if sector in sector_mom_1m else 0
+            df['SectorMom_1M'] = sector_mom_1m.get(sector, 0).shift(1) if sector else 0
             fund = get_fundamentals(ticker, fundamentals_cache, st_status)
-            for k,v in fund.items(): df[k] = v
-            df['Mom_x_Vol']    = df['CompositeMom'] / (df['Vol3']+1e-9)
+            for k, v in fund.items():
+                df[k] = v
+            df['Mom_x_Vol']    = df['CompositeMom'] / (df['Vol3'] + 1e-9)
             df['Val_x_VIX']    = df['PE'] * df['VIX']
             df['SecMom_x_VIX'] = df['SectorMom_1M'] * df['VIX']
             df.fillna(method='ffill', inplace=True)
@@ -203,7 +213,7 @@ def engineer_features_high_return(
 
             base_cols = ['CompositeMom','Vol3','Beta','VIX']
             X_poly = poly.fit_transform(df[base_cols])
-            names  = poly.get_feature_names_out(base_cols)
+            names = poly.get_feature_names_out(base_cols)
             df_poly = pd.DataFrame(
                 X_poly[:,len(base_cols):],
                 index=df.index, columns=names[len(base_cols):]
@@ -218,11 +228,10 @@ def engineer_features_high_return(
             continue
     return features
 
-def engineer_features_low_risk(
-    prices, highs, monthly_prices, monthly_returns,
-    monthly_spy_returns, sector_mom_1m,
-    sector_map, fundamentals_cache, st_status=None
-):
+def engineer_features_low_risk(prices, highs, monthly_prices,
+                               monthly_returns, monthly_spy_returns,
+                               sector_mom_1m, sector_map,
+                               fundamentals_cache, st_status=None):
     rolling_200d = prices.rolling(200).mean()
     breadth = (prices > rolling_200d).sum(axis=1)
     features = {}
@@ -240,46 +249,46 @@ def engineer_features_low_risk(
             df['CompositeMom'] = 0.5*df['M6'] + 0.5*df['M12']
             df['Vol3'] = ret.rolling(3).std().shift(1)
             df['VIX'] = monthly_prices['^VIX'].shift(1)
-            df['Beta'] = ret.rolling(12).cov(monthly_spy_returns).shift(1) / \
-                         monthly_spy_returns.rolling(12).var().shift(1)
+            df['Beta'] = (ret.rolling(12).cov(monthly_spy_returns).shift(1) /
+                          monthly_spy_returns.rolling(12).var().shift(1))
             sector = sector_map.get(ticker)
-            df['SectorMom_1M'] = sector_mom_1m[sector].shift(1) \
-                                 if sector in sector_mom_1m else 0
+            df['SectorMom_1M'] = sector_mom_1m.get(sector, 0).shift(1) if sector else 0
             fund = get_fundamentals(ticker, fundamentals_cache, st_status)
-            for k,v in fund.items(): df[k] = v
-            df['Mom_x_Vol']    = df['CompositeMom'] / (df['Vol3']+1e-9)
+            for k, v in fund.items():
+                df[k] = v
+            df['Mom_x_Vol']    = df['CompositeMom'] / (df['Vol3'] + 1e-9)
             df['Val_x_VIX']    = df['PE'] * df['VIX']
             df['SecMom_x_VIX'] = df['SectorMom_1M'] * df['VIX']
-            df['RSI_14D']      = ta.momentum.rsi(prices[ticker],14)\
-                                  .resample('M').last().shift(1)
-            df['RSI_Deviation']= df['RSI_14D'] - df['RSI_14D'].rolling(12).mean().shift(1)
+            df['RSI_14D']      = ta.momentum.rsi(prices[ticker], window=14)\
+                                     .resample('M').last().shift(1)
+            df['RSI_Deviation'] = df['RSI_14D'] - df['RSI_14D'].rolling(12).mean().shift(1)
             high_52w = highs[ticker].rolling(252).max()
-            df['52W_High_Pct']= (monthly_prices[ticker] / 
-                                high_52w.resample('M').last()).shift(1)
-            df['Return_Spread_6M']= (ret.rolling(6).sum() - 
-                                     monthly_spy_returns.rolling(6).sum()).shift(1)
+            df['52W_High_Pct'] = (monthly_prices[ticker] /
+                                  high_52w.resample('M').last()).shift(1)
+            df['Return_Spread_6M'] = (
+                ret.rolling(6).sum() - monthly_spy_returns.rolling(6).sum()
+            ).shift(1)
             df['Corr_SPY_3M'] = ret.rolling(3).corr(monthly_spy_returns).shift(1)
-            df['Market_Breadth_200D']= breadth.resample('M').last().shift(1)
+            df['Market_Breadth_200D'] = breadth.resample('M').last().shift(1)
 
             df.fillna(method='ffill', inplace=True)
             df.fillna(0, inplace=True)
 
             cols = ['CompositeMom','Vol3','Beta','VIX','RSI_14D','RSI_Deviation']
             X_poly = poly.fit_transform(df[cols])
-            names  = poly.get_feature_names_out(cols)
+            names = poly.get_feature_names_out(cols)
             df_poly = pd.DataFrame(
                 X_poly[:,len(cols):],
                 index=df.index, columns=names[len(cols):]
             )
             df = pd.concat([df, df_poly], axis=1)
-            df['Target'] = ret.shift(-1) / (df['Vol3']+1e-9)
+            df['Target'] = ret.shift(-1) / (df['Vol3'] + 1e-9)
             df.replace([np.inf,-np.inf], np.nan, inplace=True)
             df.dropna(inplace=True)
             if not df.empty:
                 features[ticker] = df
-        except Exception as e:
+        except Exception:
             continue
-
     return features
 
 # --- Live Prediction Pipeline ---
@@ -293,13 +302,11 @@ def run_live_prediction_pipeline(st_status):
     prices, highs, lows = fetch_market_data(tickers, START_DATE, END_DATE, st_status)
     fundamentals_cache = load_fundamentals_cache()
 
-    monthly_prices     = prices.resample('M').last()
-    monthly_returns    = monthly_prices.pct_change()
-    monthly_spy_returns= monthly_prices['SPY'].pct_change()
-    sector_monthly     = monthly_returns.groupby(
-        pd.Series(sector_map), axis=1
-    ).mean()
-    sector_mom_1m      = sector_monthly.rolling(1).mean()
+    monthly_prices      = prices.resample('M').last()
+    monthly_returns     = monthly_prices.pct_change()
+    monthly_spy_returns = monthly_prices['SPY'].pct_change()
+    sector_monthly      = monthly_returns.groupby(pd.Series(sector_map), axis=1).mean()
+    sector_mom_1m       = sector_monthly.rolling(1).mean()
 
     features_hr = engineer_features_high_return(
         prices, monthly_prices, monthly_returns,
@@ -319,7 +326,7 @@ def run_live_prediction_pipeline(st_status):
         return pd.DataFrame()
 
     # Dynamic regime check
-    spy_50ma = prices['SPY'].rolling(50).mean().iloc[-1]
+    spy_50ma   = prices['SPY'].rolling(50).mean().iloc[-1]
     current_spy = prices['SPY'].iloc[-1]
     current_vix = prices['^VIX'].iloc[-1]
     if current_spy < spy_50ma or current_vix > 35:
@@ -338,9 +345,9 @@ def run_live_prediction_pipeline(st_status):
         Xp_hr.append(df.drop(columns='Target').iloc[-1].values)
         tkr_hr.append(tk)
     if X_hr:
-        X_hr = np.vstack(X_hr)
-        y_hr = np.hstack(y_hr)
-        Xp_hr= np.vstack(Xp_hr)
+        X_hr  = np.vstack(X_hr)
+        y_hr  = np.hstack(y_hr)
+        Xp_hr = np.vstack(Xp_hr)
         scaler_hr = StandardScaler().fit(X_hr)
         model_hr  = XGBRegressor(
             objective='reg:squarederror',
@@ -366,9 +373,9 @@ def run_live_prediction_pipeline(st_status):
         vols.append(df['Vol3'].iloc[-1])
         tkr_lr.append(tk)
     if X_lr:
-        X_lr = np.vstack(X_lr)
-        y_lr = np.hstack(y_lr)
-        Xp_lr= np.vstack(Xp_lr)
+        X_lr  = np.vstack(X_lr)
+        y_lr  = np.hstack(y_lr)
+        Xp_lr = np.vstack(Xp_lr)
         scaler_lr = StandardScaler().fit(X_lr)
         model_lr  = XGBRegressor(
             objective='reg:squarederror',
