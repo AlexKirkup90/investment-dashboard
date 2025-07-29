@@ -19,33 +19,33 @@ from sklearn.preprocessing import StandardScaler, PolynomialFeatures
 from xgboost import XGBRegressor
 import warnings
 import streamlit as st
+from twelvedata import TDClient
 
 warnings.filterwarnings('ignore')
 
-# --- Setup Requests Session for Reliability ---
+# ——— Setup ———
 session = Session()
 session.headers['User-agent'] = (
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
     'AppleWebKit/537.36 (KHTML, like Gecko) '
     'Chrome/58.0.3029.110 Safari/537.3'
 )
-
-# --- Setup Caching ---
 CACHE_DIR = "model_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 memory = joblib.Memory(CACHE_DIR, verbose=0)
-FUNDAMENTALS_CACHE_FILE = os.path.join(CACHE_DIR, 'fundamentals_ultimate.json')
+FUND_CACHE_FILE = os.path.join(CACHE_DIR, 'fundamentals_ultimate.json')
 
-# --- Caching Functions ---
+# ——— Load Twelve Data client ———
+TD = TDClient(apikey=st.secrets["TWELVE_DATA_API_KEY"])
+
+# ——— Fundamentals caching ———
 def load_fundamentals_cache():
-    if os.path.exists(FUNDAMENTALS_CACHE_FILE):
-        with open(FUNDAMENTALS_CACHE_FILE, 'r') as f:
-            return json.load(f)
+    if os.path.exists(FUND_CACHE_FILE):
+        return json.load(open(FUND_CACHE_FILE))
     return {}
 
 def save_fundamentals_cache(cache):
-    with open(FUNDAMENTALS_CACHE_FILE, 'w') as f:
-        json.dump(cache, f, indent=4)
+    json.dump(cache, open(FUND_CACHE_FILE, 'w'), indent=4)
 
 def get_fundamentals(ticker, cache, st_status=None):
     if ticker in cache:
@@ -55,9 +55,9 @@ def get_fundamentals(ticker, cache, st_status=None):
             st_status.text(f"Fetching fundamentals for {ticker}...")
         info = yf.Ticker(ticker, session=session).info
         fcf = info.get('freeCashflow', 0)
-        mkt_cap = info.get('marketCap', 0)
-        fcf_yield = fcf / mkt_cap if mkt_cap and fcf is not None else np.nan
-        fundamentals = {
+        mkt = info.get('marketCap', 0)
+        fy = fcf/mkt if mkt else np.nan
+        fund = {
             'PE': info.get('trailingPE'),
             'PS': info.get('priceToSalesTrailing12Months'),
             'DividendYield': info.get('dividendYield'),
@@ -67,116 +67,89 @@ def get_fundamentals(ticker, cache, st_status=None):
             'EVEBITDA': info.get('enterpriseToEbitda'),
             'OperatingMargin': info.get('operatingMargins'),
             'ROA': info.get('returnOnAssets'),
-            'FCFYield': fcf_yield
+            'FCFYield': fy
         }
-        cache[ticker] = fundamentals
+        cache[ticker] = fund
         time.sleep(0.2)
-        return fundamentals
-    except Exception as e:
-        print(f"Could not fetch fundamentals for {ticker}. Error: {e}")
-        nan_fund = dict.fromkeys([
+        return fund
+    except:
+        nan_f = dict.fromkeys([
             'PE','PS','DividendYield','DebtToEquity',
             'GrossMargin','ROE','EVEBITDA','OperatingMargin',
             'ROA','FCFYield'
         ], np.nan)
-        cache[ticker] = nan_fund
-        return nan_fund
+        cache[ticker] = nan_f
+        return nan_f
 
-# --- Data Fetching ---
+# ——— Constituents ———
 @memory.cache
 def fetch_sp500_constituents():
     url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
     df = pd.read_html(requests.get(url).text)[0]
-    tickers = [t.replace('.', '-') for t in df['Symbol'].tolist()]
+    tickers = [t.replace('.', '-') for t in df['Symbol']]
     sector_map = dict(zip(tickers, df['GICS Sector']))
     return tickers, sector_map
 
+# ——— Market Data with Twelve Data fallback ———
 @memory.cache
 def fetch_market_data(tickers, start, end, st_status=None):
     all_tickers = tickers + ['SPY', '^VIX']
-    chunk_size = 20
-    all_data = []
+    chunk, all_data, successful = 20, [], set()
 
-    # 1) Try YFinance in chunks
+    # 1) Chunked Yahoo Finance
     if st_status:
         st_status.text(f"Downloading {len(all_tickers)} tickers via YFinance…")
-    for i in range(0, len(all_tickers), chunk_size):
-        chunk = all_tickers[i : i + chunk_size]
-        if st_status:
-            st_status.text(f"YF chunk {i//chunk_size+1}/{(len(all_tickers)-1)//chunk_size+1}…")
+    for i in range(0, len(all_tickers), chunk):
+        block = all_tickers[i:i+chunk]
         try:
             df = yf.download(
-                chunk, start=start, end=end,
+                block, start=start, end=end,
                 auto_adjust=True, timeout=30,
                 threads=False, session=session
             )
             if not df.empty:
                 all_data.append(df)
-        except Exception as e:
-            print(f"YF chunk error: {e}")
+                succ = df.columns.get_level_values(1).unique().tolist()
+                successful.update(succ)
+        except Exception:
+            pass
         time.sleep(5)
 
-    # 2) Fallback if needed
-    if not all_data:
-        api_key = st.secrets.get("ALPHAVANTAGE_API_KEY") or os.getenv("ALPHAVANTAGE_API_KEY")
-        if not api_key:
-            raise ConnectionError(
-                "YFinance failed and no ALPHAVANTAGE_API_KEY found in secrets or env."
-            )
-        if st_status:
-            st_status.text("YFinance failed — falling back to AlphaVantage for equities and SPY…")
-        av_frames = []
-        av_tickers = tickers + ['SPY']
-        for ticker in av_tickers:
-            try:
-                resp = session.get(
-                    "https://www.alphavantage.co/query",
-                    params={
-                        "function": "TIME_SERIES_DAILY_ADJUSTED",
-                        "symbol": ticker,
-                        "outputsize": "full",
-                        "apikey": api_key
-                    },
-                    timeout=30
-                ).json().get("Time Series (Daily)", {})
-                df = pd.DataFrame.from_dict(resp, orient='index')
-                df.index = pd.to_datetime(df.index)
-                df = df.sort_index().loc[start:end]
-                df = df.rename(columns={
-                    "2. high": "High",
-                    "3. low": "Low",
-                    "5. adjusted close": "Close"
-                })[["High","Low","Close"]]
-                df.columns = pd.MultiIndex.from_product([df.columns, [ticker]])
-                av_frames.append(df)
-                time.sleep(1)
-            except Exception as e:
-                print(f"AlphaVantage failed for {ticker}: {e}")
-        if not av_frames:
-            raise ConnectionError(
-                "Failed to fetch any equity data from both YFinance and AlphaVantage."
-            )
-        raw = pd.concat(av_frames, axis=1)
-        # 3) Always fetch VIX via yfinance
-        try:
-            vix_df = yf.download(
-                '^VIX', start=start, end=end,
-                auto_adjust=True, timeout=30,
-                session=session
-            )
-            if not vix_df.empty:
-                vix_df.columns = pd.MultiIndex.from_product([vix_df.columns, ['^VIX']])
-                raw = pd.concat([raw, vix_df], axis=1)
-        except Exception:
-            print("Warning: failed to fetch ^VIX via yfinance in fallback.")
-    else:
-        raw = pd.concat(all_data, axis=1)
+    # 2) Identify missing tickers
+    missing = [t for t in all_tickers if t not in successful]
 
-    # Final cleanup
+    # 3) Twelve Data fallback for any missing equities (batch ≤120)  [oai_citation:2‡PythonFix.com](https://pythonfix.com/pkg/t/twelvedata/?utm_source=chatgpt.com)
+    if missing:
+        batches = [missing[i:i+120] for i in range(0, len(missing), 120)]
+        for idx, batch in enumerate(batches, 1):
+            if st_status:
+                st_status.text(f"Twelve Data batch {idx}/{len(batches)}…")
+            sym_list = ",".join(batch)
+            resp = TD.time_series(
+                symbol=sym_list,
+                interval="1day",
+                start_date=start,
+                end_date=end,
+                outputsize=5000
+            )
+            df_td = resp.as_pandas()           # index=(symbol,datetime)
+            df_mc = df_td.unstack(level=0)     # columns=(field,symbol)
+            # unify column names to Title case
+            df_mc.columns = pd.MultiIndex.from_tuples([
+                (lvl0.title(), lvl1) for lvl0,lvl1 in df_mc.columns
+            ])
+            all_data.append(df_mc)
+            time.sleep(60/8)  # stay under 8 calls/min  [oai_citation:3‡support.twelvedata.com](https://support.twelvedata.com/en/articles/5194820-api-credits-limits?utm_source=chatgpt.com)
+
+    # 4) Combine & clean
+    if not all_data:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    raw = pd.concat(all_data, axis=1)
     raw = raw.loc[:, ~raw.columns.duplicated()]
-    prices = raw['Close'].dropna(axis=1, how='all')
-    highs  = raw['High'].dropna(axis=1, how='all')
-    lows   = raw['Low'].dropna(axis=1, how='all')
+    prices = raw['Close'].dropna(how='all', axis=1)
+    highs  = raw['High'].dropna(how='all', axis=1)
+    lows   = raw['Low'].dropna(how='all', axis=1)
     return prices, highs, lows
 
 # --- Feature Engineering Functions ---
