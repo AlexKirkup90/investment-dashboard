@@ -1,6 +1,6 @@
 # app.py
 import streamlit as st
-import backend  # your updated backend with AlphaVantage fallback
+import backend  # updated backend with Twelve Data fallback
 import traceback
 
 st.set_page_config(
